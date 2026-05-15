@@ -4,11 +4,11 @@ const mininet = @import("mininet");
 pub fn main(init: std.process.Init) !void {
     // initialize context
     var ctx = mininet.Context.init(init.gpa, 24672672645);
-    mininet.Context.set(&ctx);
+    _ = ctx.set();
     defer ctx.deinit();
 
     // define network
-    var simpleNet = mininet.createNetwork(struct {
+    var simpleNet = try mininet.createNetwork(struct {
         pub const inputLen = 2;
         pub fn forward(input: mininet.Tensor) !mininet.Tensor {
             var tensor = input;
@@ -34,6 +34,12 @@ pub fn main(init: std.process.Init) !void {
         .input = &.{ 1.0, 1.0 },
         .label = &.{0.0},
     } }, 0.02, 1000);
+
+    // save
+    // try std.Io.Dir.cwd().writeFile(init.io, .{
+    //     .data = std.mem.sliceAsBytes(simpleNet.parameters()),
+    //     .sub_path = "examples/xor.bin",
+    // });
 
     // predict
     {

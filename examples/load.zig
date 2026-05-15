@@ -1,56 +1,10 @@
-## About
-
-Minimal neural network library for Zig.
-
-## Features
-
-- Pure Zig
-- No dependencies
-- CPU backend
-
-## Implementations
-
-- Linear Layer
-- ReLU Layer
-- L2 Loss
-- SGD Optimizer
-
-## Requirements
-
-- Zig 0.16.0
-
-## Run example
-
-```sh
-zig build example-basic
-```
-
-## Quick start
-
-```sh
-zig fetch --save git+https://github.com/karikera/zig-mininet.git
-```
-
-- build.zig
-
-```zig
-const mininet = b.dependency("zig-mininet", .{
-    .target = target,
-    .optimize = optimize,
-});
-exe.root_module.addImport("mininet", mininet.module("mininet"));
-```
-
-- examples/basic.zig
-
-```zig
 const std = @import("std");
 const mininet = @import("mininet");
 
 pub fn main(init: std.process.Init) !void {
     // initialize context
     var ctx = mininet.Context.init(init.gpa, 24672672645);
-    _ = ctx.set();_
+    _ = ctx.set();
     defer ctx.deinit();
 
     // define network
@@ -66,20 +20,16 @@ pub fn main(init: std.process.Init) !void {
         }
     });
 
-    // train
-    try simpleNet.train(&.{ .{
-        .input = &.{ 0.0, 0.0 },
-        .label = &.{0.0},
-    }, .{
-        .input = &.{ 1.0, 0.0 },
-        .label = &.{1.0},
-    }, .{
-        .input = &.{ 0.0, 1.0 },
-        .label = &.{1.0},
-    }, .{
-        .input = &.{ 1.0, 1.0 },
-        .label = &.{0.0},
-    } }, 0.02, 1000);
+    // load
+    const parameters = try std.Io.Dir.cwd().readFileAlloc(init.io, "examples/xor.bin", init.gpa, .unlimited);
+    @memcpy(std.mem.sliceAsBytes(simpleNet.parameters()), parameters);
+    init.gpa.free(parameters);
+
+    // save
+    // try std.Io.Dir.cwd().writeFile(init.io, .{
+    //     .data = std.mem.sliceAsBytes(simpleNet.parameters()),
+    //     .sub_path = "examples/xor.bin",
+    // });
 
     // predict
     {
@@ -99,5 +49,3 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{}\n", .{res[0]});
     }
 }
-
-```

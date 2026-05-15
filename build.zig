@@ -2,15 +2,15 @@ const std = @import("std");
 
 const BuildContext = struct {
     b: *std.Build,
-    optimize: std.builtin.OptimizeMode,
     target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
     mininet: *std.Build.Module,
 
-    fn addExample(ctx: *BuildContext, name: []const u8, desc: []const u8) void {
+    fn addExample(ctx: *BuildContext, name: []const u8, desc: []const u8, path: []const u8) void {
         const module = ctx.b.createModule(.{
             .target = ctx.target,
             .optimize = ctx.optimize,
-            .root_source_file = ctx.b.path("examples/basic.zig"),
+            .root_source_file = ctx.b.path(path),
         });
         module.addImport("mininet", ctx.mininet);
         const compile = ctx.b.addExecutable(.{
@@ -25,8 +25,8 @@ const BuildContext = struct {
 pub fn build(b: *std.Build) !void {
     var ctx = BuildContext{
         .b = b,
+        .target = b.standardTargetOptions(.{}),
         .optimize = b.standardOptimizeOption(.{}),
-        .target = b.graph.host,
         .mininet = undefined,
     };
     ctx.mininet = b.addModule("mininet", .{
@@ -36,7 +36,8 @@ pub fn build(b: *std.Build) !void {
     });
 
     // example
-    ctx.addExample("example-basic", "Run basic example");
+    ctx.addExample("example-basic", "Run basic example", "examples/basic.zig");
+    ctx.addExample("example-load", "Run load example", "examples/load.zig");
 
     // test
     const test_filters = b.option(
