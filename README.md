@@ -19,12 +19,6 @@ Minimal neural network library for Zig.
 
 - Zig 0.16.0
 
-## Run example
-
-```sh
-zig build example-basic
-```
-
 ## Quick start
 
 ```sh
