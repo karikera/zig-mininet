@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
     defer ctx.deinit();
 
     // define network
-    var simpleNet = try mininet.createNetwork(struct {
+    var simpleNet = try ctx.initNetwork(struct {
         pub const inputLen = 2;
         pub fn forward(input: mininet.Tensor) !mininet.Tensor {
             var tensor = input;
@@ -59,8 +59,11 @@ pub fn main(init: std.process.Init) !void {
             return tensor;
         }
     });
+    defer simpleNet.deinit();
 
     // train
+    var opt = try mininet.Optimizer.Adam.init(&simpleNet, .{});
+    defer opt.deinit();
     try simpleNet.train(&.{ .{
         .input = &.{ 0.0, 0.0 },
         .label = &.{0.0},
@@ -73,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
     }, .{
         .input = &.{ 1.0, 1.0 },
         .label = &.{0.0},
-    } }, 0.02, 1000);
+    } }, 1000, opt.optimizer());
 
     // predict
     {

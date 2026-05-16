@@ -8,7 +8,7 @@ pub fn main(init: std.process.Init) !void {
     defer ctx.deinit();
 
     // define network
-    var simpleNet = try mininet.createNetwork(struct {
+    var simpleNet = try ctx.initNetwork(struct {
         pub const inputLen = 2;
         pub fn forward(input: mininet.Tensor) !mininet.Tensor {
             var tensor = input;
@@ -19,6 +19,7 @@ pub fn main(init: std.process.Init) !void {
             return tensor;
         }
     });
+    defer simpleNet.deinit();
 
     // load
     const parameters = try std.Io.Dir.cwd().readFileAlloc(init.io, "examples/xor.bin", init.gpa, .unlimited);

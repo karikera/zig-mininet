@@ -11,8 +11,8 @@ pub const Context = struct {
     parameterGradPack: std.ArrayList(f32),
     parameterCursor: u32,
     history: std.ArrayList(u8),
-    initializer: Initializer,
     rand: std.Random.DefaultPrng,
+    initRequested: bool,
     usingCheck: std.atomic.Value(bool),
 
     pub fn init(gpa: std.mem.Allocator, seed: u64) Context {
@@ -25,7 +25,7 @@ pub const Context = struct {
             .parameterGradPack = .empty,
             .parameterCursor = 0,
             .history = .empty,
-            .initializer = .uniform,
+            .initRequested = false,
             .usingCheck = .init(false),
         };
     }
@@ -68,13 +68,15 @@ pub const Context = struct {
         try ctx.dataPack.appendSlice(ctx.gpa, values);
         return .{ .dataIdx = @intCast(dataIdx), .dataLen = dataLen, .batchStride = dataLen, .batchLen = batchLen };
     }
+    fn createDirty(ctx: *Context, len: u32) ![]f32 {
+        return ctx.dataPack.addManyAsSlice(ctx.gpa, len);
+    }
     fn createDirtyTensor(ctx: *Context, dataLen: u32, batchLen: u32) !struct { Tensor, []f32 } {
         const totalLen = dataLen * batchLen;
         const dataIdx = ctx.dataPack.items.len;
-        const array = try ctx.dataPack.addManyAsSlice(ctx.gpa, totalLen);
         return .{
             .{ .dataIdx = @intCast(dataIdx), .dataLen = dataLen, .batchStride = dataLen, .batchLen = batchLen },
-            array,
+            try ctx.createDirty(totalLen),
         };
     }
 
@@ -99,6 +101,35 @@ pub const Context = struct {
             destPtr += outputLen;
         }
         return t;
+    }
+    fn getParameters(ctx: *Context, weights: u32) ![]f32 {
+        var params: []f32 = undefined;
+        if (ctx.parameterPack.items.len == ctx.parameterCursor) {
+            params = try ctx.parameterPack.addManyAsSlice(ctx.gpa, weights);
+        } else {
+            params = (ctx.parameterPack.items.ptr + ctx.parameterCursor)[0..weights];
+        }
+        ctx.parameterCursor += weights;
+        return params;
+    }
+
+    pub fn initNetwork(ctx: *Context, T: type) !Network(T) {
+        const scope = TensorScope.save();
+        defer scope.restore();
+
+        const xs, _ = try ctx.createDirtyTensor(T.inputLen, 1);
+        var n: Network(T) = .{
+            .parameterBegin = undefined,
+            .parameterLen = undefined,
+            .implement = T.forward,
+            .data = .{},
+        };
+        n.parameterBegin = @intCast(ctx.parameterPack.items.len);
+        ctx.parameterCursor = n.parameterBegin;
+        ctx.history.clearRetainingCapacity();
+        _ = try n.implement(xs);
+        n.parameterLen = @intCast(ctx.parameterPack.items.len - n.parameterBegin);
+        return n;
     }
 };
 
@@ -191,9 +222,125 @@ pub const DataPair = struct {
     label: []const f32,
 };
 
-pub fn createNetwork(T: type) !Network(T) {
-    return Network(T).init();
-}
+pub const Optimizer = struct {
+    optimizeFn: *const fn (data: *anyopaque) void,
+    data: *anyopaque,
+
+    pub const SGD = struct {
+        learningRate: f32,
+        parameterBegin: u32,
+        parameterLen: u32,
+
+        pub fn init(net: anytype, learningRate: f32) !SGD {
+            return .{
+                .learningRate = learningRate,
+                .parameterBegin = net.parameterBegin,
+                .parameterLen = net.parameterLen,
+            };
+        }
+
+        pub fn optimizer(this: *SGD) Optimizer {
+            const Impl = struct {
+                fn optimizeImpl(data: *anyopaque) void {
+                    const sgd: *SGD = @ptrCast(@alignCast(data));
+                    const ctx = context orelse unreachable;
+                    const params = ctx.parameterPack.items[sgd.parameterBegin .. sgd.parameterBegin + sgd.parameterLen];
+                    const grads = ctx.parameterGradPack.items[sgd.parameterBegin .. sgd.parameterBegin + sgd.parameterLen];
+                    const lr = sgd.learningRate;
+                    for (params, grads) |*param, grad| {
+                        param.* -= grad * lr;
+                    }
+                }
+            };
+            return .{
+                .data = @ptrCast(this),
+                .optimizeFn = Impl.optimizeImpl,
+            };
+        }
+    };
+    pub const Adam = struct {
+        learningRate: f32,
+        b1: f32,
+        b2: f32,
+        epsilon: f32,
+        parameterBegin: u32,
+        parameterLen: u32,
+        data: []f32,
+        step: f32,
+
+        pub const Options = struct {
+            learningRate: f32 = 0.001,
+            b1: f32 = 0.9,
+            b2: f32 = 0.999,
+            epsilon: f32 = 1e-8,
+        };
+
+        pub fn init(net: anytype, opts: Options) !Adam {
+            const ctx = context orelse unreachable;
+            const data = try ctx.gpa.alloc(f32, net.parameterLen * 2);
+            @memset(data, 0.0);
+
+            return .{
+                .learningRate = opts.learningRate,
+                .b1 = opts.b1,
+                .b2 = opts.b2,
+                .epsilon = opts.epsilon,
+                .parameterBegin = net.parameterBegin,
+                .parameterLen = net.parameterLen,
+                .data = data,
+                .step = 0,
+            };
+        }
+        pub fn deinit(adam: *Adam) void {
+            const ctx = context orelse unreachable;
+            ctx.gpa.free(adam.data);
+            adam.* = undefined;
+        }
+
+        pub fn optimizer(this: *Adam) Optimizer {
+            const Impl = struct {
+                fn optimizeImpl(data: *anyopaque) void {
+                    const adam: *Adam = @ptrCast(@alignCast(data));
+                    const ctx = context orelse unreachable;
+
+                    var mvPtr = adam.data.ptr;
+                    const b1 = adam.b1;
+                    const b2 = adam.b2;
+                    const ib1 = 1 - adam.b1;
+                    const ib2 = 1 - adam.b2;
+                    const params = ctx.parameterPack.items[adam.parameterBegin .. adam.parameterBegin + adam.parameterLen];
+                    const grads = ctx.parameterGradPack.items[adam.parameterBegin .. adam.parameterBegin + adam.parameterLen];
+                    const lr = adam.learningRate;
+                    const e = adam.epsilon;
+                    adam.step += 1.0;
+                    const ibt1 = 1 - std.math.pow(f32, b1, adam.step);
+                    const ibt2 = 1 - std.math.pow(f32, b2, adam.step);
+
+                    for (params, grads) |*param, grad| {
+                        var m = mvPtr[0];
+                        m = b1 * m + ib1 * grad;
+                        mvPtr[0] = m;
+                        mvPtr += 1;
+                        var v = mvPtr[0];
+                        v = b2 * v + ib2 * (grad * grad);
+                        mvPtr[0] = v;
+                        mvPtr += 1;
+                        const res = lr * (m / ibt1) / (std.math.sqrt(v / ibt2) + e);
+                        param.* -= res;
+                    }
+                }
+            };
+            return .{
+                .data = @ptrCast(this),
+                .optimizeFn = Impl.optimizeImpl,
+            };
+        }
+    };
+
+    pub fn optimize(opt: Optimizer) void {
+        opt.optimizeFn(opt.data);
+    }
+};
 
 pub fn Network(T: type) type {
     return struct {
@@ -202,30 +349,10 @@ pub fn Network(T: type) type {
         implement: *const fn (xs: Tensor) anyerror!Tensor,
         data: T,
 
-        pub fn init() !@This() {
-            const ctx = context orelse unreachable;
-
-            const oldInit = ctx.initializer;
-            defer ctx.initializer = oldInit;
-            ctx.initializer = .uninit;
-
-            const scope = TensorScope.save();
-            defer scope.restore();
-
-            const xs, _ = try ctx.createDirtyTensor(T.inputLen, 1);
-            var n: @This() = .{
-                .parameterBegin = undefined,
-                .parameterLen = undefined,
-                .implement = T.forward,
-                .data = .{},
-            };
-            n.parameterBegin = @intCast(ctx.parameterPack.items.len);
-            ctx.parameterCursor = n.parameterBegin;
-            ctx.history.clearRetainingCapacity();
-            _ = try n.implement(xs);
-            n.parameterLen = @intCast(ctx.parameterPack.items.len - n.parameterBegin);
-            return n;
+        pub fn deinit(n: *@This()) void {
+            n.* = undefined;
         }
+
         pub fn predict(n: *@This(), input: []const f32) ![]f32 {
             const ctx = context orelse unreachable;
             if (input.len == 0) {
@@ -255,15 +382,17 @@ pub fn Network(T: type) type {
         }
 
         // return loss
-        pub fn trainOnceWithTensor(n: *@This(), xs: Tensor, labels: Tensor, learningRate: f32) !Tensor {
+        pub fn trainOnceWithTensor(n: *@This(), xs: Tensor, labels: Tensor, optimizer: Optimizer) !Tensor {
+            const scope = TensorScope.save();
+            defer scope.restore();
             const ys = try n.predictWithTensor(xs);
             const loss = try ys.l2Loss(labels);
             try loss.backward(&.{1.0});
-            sgd(learningRate);
+            optimizer.optimize();
             return loss;
         }
 
-        pub fn train(n: *@This(), data: []const DataPair, learningRate: f32, epoch: u32) !void {
+        pub fn train(n: *@This(), data: []const DataPair, epoch: u32, optimizer: Optimizer) !void {
             const ctx = context orelse unreachable;
             if (data.len == 0) return;
 
@@ -273,12 +402,44 @@ pub fn Network(T: type) type {
             const xs = try ctx.generateInputTensor(data);
             const labels = try ctx.generateLabelTensor(data);
 
-            for (0..epoch) |_| {
-                const scope2 = TensorScope.save();
-                defer scope2.restore();
+            var lossSum: f32 = 0;
+            var printedStep: u32 = 0;
+            var step: u32 = 0;
+            const sumMax = @max((epoch + 5) / 10, 1);
 
-                _ = try n.trainOnceWithTensor(xs, labels, learningRate);
+            for (0..epoch) |_| {
+                const loss = try n.trainOnceWithTensor(xs, labels, optimizer);
+                lossSum += loss.dataPtr()[0];
+                step += 1;
+                const sumCount = step - printedStep;
+                if (sumCount >= sumMax) {
+                    const sumCountF: f32 = @floatFromInt(sumCount);
+                    printedStep = step;
+
+                    const lossMean = lossSum / sumCountF;
+                    lossSum = 0;
+                    std.debug.print("[{}] Loss = {}\n", .{ step, lossMean });
+                }
             }
+
+            const sumCount = step - printedStep;
+            if (sumCount > 0) {
+                const sumCountF: f32 = @floatFromInt(sumCount);
+                const lossMean = lossSum / sumCountF;
+                std.debug.print("[{}] Loss = {}\n", .{ step, lossMean });
+            }
+        }
+
+        pub fn randomInitialize(n: *@This()) !void {
+            const ctx = context orelse unreachable;
+            ctx.initRequested = true;
+            defer ctx.initRequested = false;
+
+            const scope = TensorScope.save();
+            defer scope.restore();
+
+            const xs, _ = try ctx.createDirtyTensor(T.inputLen, 1);
+            _ = try n.predictWithTensor(xs);
         }
 
         pub fn parameters(n: *@This()) []f32 {
@@ -392,10 +553,16 @@ pub const Tensor = struct {
         const xLen = xt.dataLen;
         const xStride = xt.batchStride;
         const weights = yLen * (xLen + 1);
-        const inputLenF32: f32 = @floatFromInt(xLen);
-        const outputLenF32: f32 = @floatFromInt(yLen);
         const paramIdx = ctx.parameterCursor;
-        const ps: []f32 = try getParameters(weights, std.math.sqrt(6.0 / (inputLenF32 + outputLenF32)));
+        const ps: []f32 = try ctx.getParameters(weights);
+        if (ctx.initRequested) {
+            const inputLenF32: f32 = @floatFromInt(xLen);
+            const outputLenF32: f32 = @floatFromInt(yLen);
+            const range = std.math.sqrt(6.0 / (inputLenF32 + outputLenF32));
+            for (ps) |*v| {
+                v.* = (ctx.rand.random().float(f32) * 2 - 1) * range;
+            }
+        }
 
         const xs = xt.dataPtr();
         const yt, const ys = try Tensor.initUndef(yLen, xt.batchLen);
@@ -543,14 +710,16 @@ pub const Tensor = struct {
 
         fn backward(b: @This()) void {
             const ctx = context orelse unreachable;
-            const gy2 = ctx.dataGradPack.items.ptr[b.yIdx] * 2;
             var xWalker = b.xt.dataWalker();
             var labelWalker = b.labelT.dataWalker();
             const gdo = ctx.gradDataOffset();
+            const total: f32 = @floatFromInt(b.xt.dataLen * b.xt.batchLen);
+            const gy = ctx.dataGradPack.items.ptr[b.yIdx];
+            const c = gy * 2 / total;
 
             while (xWalker.next()) {
                 std.debug.assert(labelWalker.next());
-                const grad = (xWalker.ptr[0] - labelWalker.ptr[0]) * gy2;
+                const grad = (xWalker.ptr[0] - labelWalker.ptr[0]) * c;
                 gdo.ptr(xWalker.ptr)[0] += grad;
                 gdo.ptr(labelWalker.ptr)[0] -= grad;
             }
@@ -1064,31 +1233,6 @@ fn readHistory(T: type) T {
     @memcpy(std.mem.asBytes(&out), src[0..size]);
     return out;
 }
-fn getParameters(weights: u32, range: f32) ![]f32 {
-    const ctx = context orelse unreachable;
-    var params: []f32 = undefined;
-    if (ctx.parameterPack.items.len == ctx.parameterCursor) {
-        params = try ctx.parameterPack.addManyAsSlice(ctx.gpa, weights);
-        switch (ctx.initializer) {
-            .uninit => {},
-            .uniform => {
-                for (params) |*v| {
-                    v.* = (ctx.rand.random().float(f32) * 2 - 1) * range;
-                }
-            },
-        }
-    } else {
-        params = (ctx.parameterPack.items.ptr + ctx.parameterCursor)[0..weights];
-    }
-    ctx.parameterCursor += weights;
-    return params;
-}
-fn sgd(learningRate: f32) void {
-    const ctx = context orelse unreachable;
-    for (ctx.parameterPack.items, ctx.parameterGradPack.items) |*param, grad| {
-        param.* -= grad * learningRate;
-    }
-}
 
 // tests
 
@@ -1119,7 +1263,7 @@ test "mininet linear" {
     _ = ctx.set();
     defer ctx.deinit();
 
-    var testNet = createNetwork(TestNet);
+    var testNet = try ctx.initNetwork(TestNet);
     @memcpy(testNet.parameters(), &.{ 0.7, 0.1, 0.2, 0.8, 0.3, 0.4, 0.9, 0.5, 0.6 });
     try testingApproxEq(&.{ 1.2, 1.9, 2.6 }, try testNet.predict(&.{ 1, 2 }));
     try testingApproxEq(&.{ 1.8, 3.3, 4.8 }, try testNet.predict(&.{ 3, 4 }));
@@ -1131,7 +1275,7 @@ test "mininet backward" {
     _ = ctx.set();
     defer ctx.deinit();
 
-    var testNet = createNetwork(TestNet);
+    var testNet = try ctx.initNetwork(TestNet);
     @memcpy(testNet.parameters(), &.{ 0.7, 0.1, 0.2, 0.8, 0.3, 0.4, 0.9, 0.5, 0.6 });
 
     const scope = TensorScope.save();
