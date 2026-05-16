@@ -7,13 +7,7 @@ Minimal neural network library for Zig.
 - Pure Zig
 - No dependencies
 - CPU backend
-
-## Implementations
-
-- Linear Layer
-- ReLU Layer
-- L2 Loss
-- SGD Optimizer
+- Experimental
 
 ## Requirements
 
