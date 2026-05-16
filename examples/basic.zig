@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
     try simpleNet.randomInitialize();
 
     // train
-    var opt = try mininet.Optimizer.Adam.init(&simpleNet, .{});
+    var opt = try mininet.Optimizer.Adam.init(&simpleNet, .{ .learningRate = 0.005 });
     defer opt.deinit();
     try simpleNet.train(&.{ .{
         .input = &.{ 0.0, 0.0 },

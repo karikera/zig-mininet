@@ -46,9 +46,8 @@ pub fn main(init: std.process.Init) !void {
         pub const inputLen = 2;
         pub fn forward(input: mininet.Tensor) !mininet.Tensor {
             var tensor = input;
-            tensor = try tensor.linear(3);
+            tensor = try tensor.linear(4);
             tensor = try tensor.relu();
-            tensor = try tensor.linear(3);
             tensor = try tensor.linear(1);
             return tensor;
         }
@@ -56,7 +55,7 @@ pub fn main(init: std.process.Init) !void {
     defer simpleNet.deinit();
 
     // train
-    var opt = try mininet.Optimizer.Adam.init(&simpleNet, .{});
+    var opt = try mininet.Optimizer.Adam.init(&simpleNet, .{ .learningRate = 0.005 });
     defer opt.deinit();
     try simpleNet.train(&.{ .{
         .input = &.{ 0.0, 0.0 },

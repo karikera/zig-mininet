@@ -246,6 +246,10 @@ pub const Optimizer = struct {
             };
         }
 
+        pub fn deinit(this: *SGD) void {
+            this.* = undefined;
+        }
+
         pub fn optimizer(this: *SGD) Optimizer {
             const Impl = struct {
                 fn optimizeImpl(data: *anyopaque) void {
@@ -298,10 +302,10 @@ pub const Optimizer = struct {
                 .step = 0,
             };
         }
-        pub fn deinit(adam: *Adam) void {
+        pub fn deinit(this: *Adam) void {
             const ctx = context orelse unreachable;
-            ctx.gpa.free(adam.data);
-            adam.* = undefined;
+            ctx.gpa.free(this.data);
+            this.* = undefined;
         }
 
         pub fn optimizer(this: *Adam) Optimizer {

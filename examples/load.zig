@@ -12,9 +12,8 @@ pub fn main(init: std.process.Init) !void {
         pub const inputLen = 2;
         pub fn forward(input: mininet.Tensor) !mininet.Tensor {
             var tensor = input;
-            tensor = try tensor.linear(3);
+            tensor = try tensor.linear(4);
             tensor = try tensor.relu();
-            tensor = try tensor.linear(3);
             tensor = try tensor.linear(1);
             return tensor;
         }
