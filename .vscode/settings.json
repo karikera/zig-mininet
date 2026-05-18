@@ -1,0 +1,12 @@
+{
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "editor.formatOnSave": true,
+  "zig.testArgs": ["build", "test", "-Dtest-filter=${filter}"],
+  "zig.debugTestArgs": [
+    "build",
+    "install-test",
+    "-Dtest-filter=${filter}",
+    "-Demit-bin=${binaryPath}"
+  ],
+  "zig.path": "zig"
+}
