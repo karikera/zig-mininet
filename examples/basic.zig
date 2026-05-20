@@ -3,7 +3,7 @@ const mininet = @import("mininet");
 
 pub fn main(init: std.process.Init) !void {
     // initialize context
-    var ctx = mininet.Context.init(init.gpa, 24672672645);
+    var ctx = try mininet.Context.init(init.gpa, 24672672645);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -17,12 +17,11 @@ pub fn main(init: std.process.Init) !void {
             tensor = try tensor.linear(1);
             return tensor;
         }
-    });
+    }, .{});
     defer simpleNet.deinit();
-    try simpleNet.randomInitialize();
 
     // train
-    var opt = try mininet.Optimizer.Adam.init(&simpleNet, .{ .learningRate = 0.005 });
+    var opt = try mininet.Optimizer.Adam.init(.{ .learningRate = 0.005 });
     defer opt.deinit();
     try simpleNet.train(&.{ .{
         .input = &.{ 0.0, 0.0 },

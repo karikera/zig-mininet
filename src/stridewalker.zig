@@ -1,5 +1,6 @@
-const StrideWalker = @This();
 const std = @import("std");
+
+const StrideWalker = @This();
 
 ptr: [*]f32,
 end: [*]f32,

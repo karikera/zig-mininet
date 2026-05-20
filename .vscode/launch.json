@@ -5,10 +5,22 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "debug mininet",
+      "name": "debug basic",
       "type": "cppvsdbg",
       "request": "launch",
       "program": "${workspaceFolder}/zig-out/bin/example-basic.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "console": "integratedTerminal",
+      "preLaunchTask": "build mininet"
+    },
+    {
+      "name": "debug load",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/zig-out/bin/example-load.exe",
       "args": [],
       "stopAtEntry": false,
       "cwd": "${workspaceFolder}",

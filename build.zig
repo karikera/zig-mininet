@@ -51,7 +51,11 @@ pub fn build(b: *std.Build) !void {
         "Run only matching tests",
     ) orelse &.{};
     const tests = b.addTest(.{
-        .root_module = ctx.mininet,
+        .root_module = b.createModule(.{
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+            .root_source_file = b.path("src/tests.zig"),
+        }),
         .filters = test_filters,
     });
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);

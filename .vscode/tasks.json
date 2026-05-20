@@ -5,14 +5,11 @@
       "label": "build mininet",
       "type": "shell",
       "command": "zig build install",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "problemMatcher": {
-        "base": "$zig",
-        "fileLocation": ["relative", "${workspaceFolder}/zig-libs/mininet"]
-      },
-      "group": "build"
+      "problemMatcher": "$zig",
+      "group": {
+        "isDefault": true,
+        "kind": "build"
+      }
     }
   ]
 }

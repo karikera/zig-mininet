@@ -3,44 +3,114 @@ const StrideWalker = @import("stridewalker.zig");
 
 threadlocal var context: ?*Context = null;
 
+const TensorStoreData = struct {
+    data: std.ArrayList(f32),
+    grad: std.ArrayList(f32),
+    train: std.ArrayList(f32),
+
+    pub const empty: TensorStoreData = .{
+        .data = .empty,
+        .grad = .empty,
+        .train = .empty,
+    };
+
+    pub fn deinit(store: *TensorStoreData, gpa: std.mem.Allocator) void {
+        store.data.deinit(gpa);
+        store.grad.deinit(gpa);
+        store.train.deinit(gpa);
+        store.* = undefined;
+    }
+
+    fn gradDataOffset(store: *TensorStoreData) GradDataOffset {
+        return .{ .bytes = @intFromPtr(store.grad.items.ptr) -% @intFromPtr(store.data.items.ptr) };
+    }
+};
+
+const TensorPointer = struct {
+    store: TensorStore,
+    dataIdx: u32,
+
+    pub fn dataPtr(tp: TensorPointer) [*]f32 {
+        return tp.store.data().data.items.ptr + tp.dataIdx;
+    }
+    pub fn gradientPtr(tp: TensorPointer) [*]f32 {
+        return tp.store.data().grad.items.ptr + tp.dataIdx;
+    }
+    pub fn assertGradient(tp: TensorPointer, len: usize) void {
+        std.debug.assert(tp.store.data().grad.items.len >= tp.dataIdx + len); // backward required
+    }
+};
+
+const DefTensorPointer = struct {
+    dataIdx: u32,
+
+    pub fn initUndef(totalLen: u32) !struct { DefTensorPointer, []f32 } {
+        const ctx = context orelse unreachable;
+        const store = TensorStore.def.data();
+        const dataIdx = store.data.items.len;
+        return .{
+            .{
+                .dataIdx = @intCast(dataIdx),
+            },
+            try store.data.addManyAsSlice(ctx.gpa, totalLen),
+        };
+    }
+    pub fn dataPtr(tp: DefTensorPointer) [*]f32 {
+        return TensorStore.def.data().data.items.ptr + tp.dataIdx;
+    }
+    pub fn gradientPtr(tp: DefTensorPointer) [*]f32 {
+        return TensorStore.def.data().grad.items.ptr + tp.dataIdx;
+    }
+    pub fn assertGradient(tp: DefTensorPointer, len: usize) void {
+        std.debug.assert(TensorStore.def.data().grad.items.len >= tp.dataIdx + len); // backward required
+    }
+    pub fn asTensor(tp: DefTensorPointer, dataLen: u32, batchStride: u32, batchLen: u32) Tensor {
+        return .{
+            .ptr = .{
+                .store = TensorStore.def,
+                .dataIdx = tp.dataIdx,
+            },
+            .dataLen = dataLen,
+            .batchStride = batchStride,
+            .batchLen = batchLen,
+        };
+    }
+};
+
 pub const Context = struct {
     gpa: std.mem.Allocator,
-    dataPack: std.ArrayList(f32),
-    dataGradPack: std.ArrayList(f32),
-    parameterPack: std.ArrayList(f32),
-    parameterGradPack: std.ArrayList(f32),
-    parameterCursor: u32,
-    cachePack: std.ArrayList(f32),
-    history: std.ArrayList(u8),
     rand: std.Random.DefaultPrng,
+    stores: std.ArrayList(TensorStoreData),
+    parameterCursor: u32,
+    parameterStore: TensorStore,
     initRequested: bool,
     usingCheck: std.atomic.Value(bool),
+    history: HistoryBuffer,
 
-    pub fn init(gpa: std.mem.Allocator, seed: u64) Context {
+    pub fn init(gpa: std.mem.Allocator, seed: u64) !Context {
+        var stores = try std.ArrayList(TensorStoreData).initCapacity(gpa, 2);
+        stores.appendAssumeCapacity(.empty);
+        stores.appendAssumeCapacity(.empty);
         return .{
-            .rand = .init(seed), // random seed
             .gpa = gpa,
-            .dataPack = .empty,
-            .dataGradPack = .empty,
-            .parameterPack = .empty,
-            .parameterGradPack = .empty,
+            .rand = .init(seed), // random seed
+            .stores = stores,
             .parameterCursor = 0,
-            .cachePack = .empty,
-            .history = .empty,
+            .parameterStore = undefined,
             .initRequested = false,
             .usingCheck = .init(false),
+            .history = .empty,
         };
     }
     pub fn deinit(ctx: *Context) void {
         if (context == ctx) {
             context = null;
         }
-        ctx.parameterPack.deinit(ctx.gpa);
-        ctx.parameterGradPack.deinit(ctx.gpa);
-        ctx.dataPack.deinit(ctx.gpa);
-        ctx.dataGradPack.deinit(ctx.gpa);
-        ctx.cachePack.deinit(ctx.gpa);
         ctx.history.deinit(ctx.gpa);
+        for (ctx.stores.items) |*store| {
+            store.deinit(ctx.gpa);
+        }
+        ctx.stores.deinit(ctx.gpa);
         ctx.* = undefined;
     }
 
@@ -62,78 +132,48 @@ pub const Context = struct {
         }
     }
 
-    fn gradDataOffset(ctx: *Context) GradDataOffset {
-        return .{ .bytes = @intFromPtr(ctx.dataGradPack.items.ptr) -% @intFromPtr(ctx.dataPack.items.ptr) };
-    }
-    fn createTensor(ctx: *Context, values: []const f32, dataLen: u32, batchLen: u32) !Tensor {
-        std.debug.assert(dataLen * batchLen == values.len);
-        const dataIdx = ctx.dataPack.items.len;
-        try ctx.dataPack.appendSlice(ctx.gpa, values);
-        return .{ .dataIdx = @intCast(dataIdx), .dataLen = dataLen, .batchStride = dataLen, .batchLen = batchLen };
-    }
-    fn createDirtyCache(ctx: *Context, len: u32) !struct { u32, []f32 } {
-        const cacheIdx: u32 = @intCast(ctx.cachePack.items.len);
-        return .{ cacheIdx, try ctx.cachePack.addManyAsSlice(ctx.gpa, len) };
-    }
-    fn createDirtyTensor(ctx: *Context, dataLen: u32, batchLen: u32) !struct { Tensor, []f32 } {
-        const totalLen = dataLen * batchLen;
-        const dataIdx = ctx.dataPack.items.len;
-        return .{
-            .{ .dataIdx = @intCast(dataIdx), .dataLen = dataLen, .batchStride = dataLen, .batchLen = batchLen },
-            try ctx.dataPack.addManyAsSlice(ctx.gpa, totalLen),
-        };
-    }
-
-    fn generateInputTensor(ctx: *Context, data: []const DataPair) !Tensor {
-        std.debug.assert(data.len != 0);
-        const inputLen: u32 = @intCast(data[0].input.len);
-        const t, const dest = try ctx.createDirtyTensor(inputLen, @intCast(data.len));
-        var destPtr = dest.ptr;
-        for (data) |d| {
-            @memcpy(destPtr[0..inputLen], d.input);
-            destPtr += inputLen;
-        }
-        return t;
-    }
-    fn generateLabelTensor(ctx: *Context, data: []const DataPair) !Tensor {
-        std.debug.assert(data.len != 0);
-        const outputLen: u32 = @intCast(data[0].label.len);
-        const t, const dest = try ctx.createDirtyTensor(outputLen, @intCast(data.len));
-        var destPtr = dest.ptr;
-        for (data) |d| {
-            @memcpy(destPtr[0..outputLen], d.label);
-            destPtr += outputLen;
-        }
-        return t;
-    }
     fn getParameters(ctx: *Context, weights: u32) ![]f32 {
         var params: []f32 = undefined;
-        if (ctx.parameterPack.items.len == ctx.parameterCursor) {
-            params = try ctx.parameterPack.addManyAsSlice(ctx.gpa, weights);
+        const store = &ctx.stores.items[ctx.parameterStore.id];
+        if (store.data.items.len == ctx.parameterCursor) {
+            params = try store.data.addManyAsSlice(ctx.gpa, weights);
         } else {
-            params = (ctx.parameterPack.items.ptr + ctx.parameterCursor)[0..weights];
+            params = (store.data.items.ptr + ctx.parameterCursor)[0..weights];
         }
         ctx.parameterCursor += weights;
         return params;
     }
-
-    pub fn initNetwork(ctx: *Context, T: type) !Network(T) {
-        const scope = TensorScope.save();
-        defer scope.restore();
-
-        const xs, _ = try ctx.createDirtyTensor(T.inputLen, 1);
-        var n: Network(T) = .{
-            .parameterBegin = undefined,
-            .parameterLen = undefined,
-            .implement = T.forward,
-            .data = .{},
+    fn parameterPtr(ctx: *Context) TensorPointer {
+        return .{
+            .store = ctx.parameterStore,
+            .dataIdx = ctx.parameterCursor,
         };
-        n.parameterBegin = @intCast(ctx.parameterPack.items.len);
-        ctx.parameterCursor = n.parameterBegin;
-        ctx.history.clearRetainingCapacity();
-        _ = try n.implement(xs);
-        n.parameterLen = @intCast(ctx.parameterPack.items.len - n.parameterBegin);
-        return n;
+    }
+    fn createRawTensor(ctx: *Context, store: TensorStore, dataLen: u32, batchLen: u32) !struct { Tensor, []f32 } {
+        const sd = &ctx.stores.items[store.id];
+        const totalLen = dataLen * batchLen;
+        const dataIdx = sd.data.items.len;
+        return .{
+            .{
+                .ptr = .{
+                    .store = store,
+                    .dataIdx = @intCast(dataIdx),
+                },
+                .dataLen = dataLen,
+                .batchStride = dataLen,
+                .batchLen = batchLen,
+            },
+            try sd.data.addManyAsSlice(ctx.gpa, totalLen),
+        };
+    }
+
+    pub fn initNetwork(ctx: *Context, T: type, opts: NetworkOptions) !Network(T) {
+        return .init(ctx, opts);
+    }
+    pub fn initStore(ctx: *Context) !TensorStore {
+        const id = ctx.stores.items.len;
+        try ctx.stores.append(ctx.gpa, .empty);
+        return .{ .id = @intCast(id) };
     }
 };
 
@@ -174,6 +214,10 @@ pub const TensorData = struct {
         try writer.writeByte('}');
     }
 
+    pub fn batch(t: TensorData, batchIndex: u32) []f32 {
+        const off = batchIndex * t.batchStride;
+        return t.data[off .. off + t.dataLen];
+    }
     pub fn copyTo(t: TensorData, dest: [*]f32) void {
         var srcPtr = t.data;
         const srcEnd = srcPtr + t.batchLen * t.batchStride;
@@ -194,7 +238,7 @@ pub const TensorData = struct {
             destPtr += t.batchStride;
         }
     }
-    fn testingApproxEq(t: TensorData, expected: []const f32) !void {
+    pub fn testingApproxEq(t: TensorData, expected: []const f32) !void {
         var walker = StrideWalker.init(t.data, t.dataLen, t.batchStride, t.batchLen);
         return walker.testingApproxEq(expected);
     }
@@ -205,22 +249,62 @@ const Initializer = enum {
     uniform,
 };
 
-const BackwardFn = *const fn () void;
+pub const TensorStore = struct {
+    id: u32,
+
+    pub const def: TensorStore = .{ .id = 0 };
+    pub const network: TensorStore = .{ .id = 1 };
+
+    pub fn data(ts: TensorStore) *TensorStoreData {
+        const ctx = context orelse unreachable;
+        return &ctx.stores.items[ts.id];
+    }
+
+    pub fn create(store: TensorStore, values: []f32, dataLen: u32, batchLen: u32) !Tensor {
+        const out, const dest = try store.createUndef(dataLen, batchLen);
+        @memcpy(dest, values);
+        return out;
+    }
+    pub fn createUndef(store: TensorStore, dataLen: u32, batchLen: u32) !struct { Tensor, []f32 } {
+        const ctx = context orelse unreachable;
+        return ctx.createRawTensor(store, dataLen, batchLen);
+    }
+    pub fn collectInputsOf(store: TensorStore, dataPair: []const DataPair) !Tensor {
+        std.debug.assert(dataPair.len != 0);
+        const inputLen: u32 = @intCast(dataPair[0].input.len);
+        const t, const dest = try store.createUndef(inputLen, @intCast(dataPair.len));
+        var destPtr = dest.ptr;
+        for (dataPair) |d| {
+            @memcpy(destPtr[0..inputLen], d.input);
+            destPtr += inputLen;
+        }
+        return t;
+    }
+    pub fn collectLabelsOf(store: TensorStore, dataPair: []const DataPair) !Tensor {
+        std.debug.assert(dataPair.len != 0);
+        const outputLen: u32 = @intCast(dataPair[0].label.len);
+        const t, const dest = try store.createUndef(outputLen, @intCast(dataPair.len));
+        var destPtr = dest.ptr;
+        for (dataPair) |d| {
+            @memcpy(destPtr[0..outputLen], d.label);
+            destPtr += outputLen;
+        }
+        return t;
+    }
+};
 
 pub const TensorScope = struct {
     dataIdx: usize,
-    cacheIdx: usize,
 
     pub fn save() TensorScope {
-        const ctx = context orelse unreachable;
-        return .{ .dataIdx = ctx.dataPack.items.len, .cacheIdx = ctx.cachePack.items.len };
+        return .{
+            .dataIdx = TensorStore.def.data().data.items.len,
+        };
     }
     pub fn restore(s: TensorScope) void {
-        const ctx = context orelse unreachable;
-        std.debug.assert(ctx.dataPack.items.len >= s.dataIdx);
-        std.debug.assert(ctx.cachePack.items.len >= s.cacheIdx);
-        ctx.dataPack.items.len = s.dataIdx;
-        ctx.cachePack.items.len = s.cacheIdx;
+        const sd = TensorStore.def.data();
+        std.debug.assert(sd.data.items.len >= s.dataIdx);
+        sd.data.items.len = s.dataIdx;
     }
 };
 
@@ -230,19 +314,15 @@ pub const DataPair = struct {
 };
 
 pub const Optimizer = struct {
-    optimizeFn: *const fn (data: *anyopaque) void,
+    optimizeFn: *const fn (data: *anyopaque, stores: []const TensorStore) std.mem.Allocator.Error!void,
     data: *anyopaque,
 
     pub const SGD = struct {
         learningRate: f32,
-        parameterBegin: u32,
-        parameterLen: u32,
 
-        pub fn init(net: anytype, learningRate: f32) !SGD {
+        pub fn init(learningRate: f32) !SGD {
             return .{
                 .learningRate = learningRate,
-                .parameterBegin = net.parameterBegin,
-                .parameterLen = net.parameterLen,
             };
         }
 
@@ -252,14 +332,16 @@ pub const Optimizer = struct {
 
         pub fn optimizer(this: *SGD) Optimizer {
             const Impl = struct {
-                fn optimizeImpl(data: *anyopaque) void {
+                fn optimizeImpl(data: *anyopaque, stores: []const TensorStore) std.mem.Allocator.Error!void {
                     const sgd: *SGD = @ptrCast(@alignCast(data));
-                    const ctx = context orelse unreachable;
-                    const params = ctx.parameterPack.items[sgd.parameterBegin .. sgd.parameterBegin + sgd.parameterLen];
-                    const grads = ctx.parameterGradPack.items[sgd.parameterBegin .. sgd.parameterBegin + sgd.parameterLen];
                     const lr = sgd.learningRate;
-                    for (params, grads) |*param, grad| {
-                        param.* -= grad * lr;
+                    for (stores) |store| {
+                        const sd = store.data();
+                        const params = sd.data.items;
+                        const grads = sd.grad.items;
+                        for (params, grads) |*param, grad| {
+                            param.* -= grad * lr;
+                        }
                     }
                 }
             };
@@ -274,9 +356,6 @@ pub const Optimizer = struct {
         b1: f32,
         b2: f32,
         epsilon: f32,
-        parameterBegin: u32,
-        parameterLen: u32,
-        data: []f32,
         step: f32,
 
         pub const Options = struct {
@@ -286,58 +365,60 @@ pub const Optimizer = struct {
             epsilon: f32 = 1e-8,
         };
 
-        pub fn init(net: anytype, opts: Options) !Adam {
-            const ctx = context orelse unreachable;
-            const data = try ctx.gpa.alloc(f32, net.parameterLen * 2);
-            @memset(data, 0.0);
-
+        pub fn init(opts: Options) !Adam {
             return .{
                 .learningRate = opts.learningRate,
                 .b1 = opts.b1,
                 .b2 = opts.b2,
                 .epsilon = opts.epsilon,
-                .parameterBegin = net.parameterBegin,
-                .parameterLen = net.parameterLen,
-                .data = data,
                 .step = 0,
             };
         }
         pub fn deinit(this: *Adam) void {
-            const ctx = context orelse unreachable;
-            ctx.gpa.free(this.data);
             this.* = undefined;
         }
 
         pub fn optimizer(this: *Adam) Optimizer {
             const Impl = struct {
-                fn optimizeImpl(data: *anyopaque) void {
-                    const adam: *Adam = @ptrCast(@alignCast(data));
+                fn optimizeImpl(data: *anyopaque, stores: []const TensorStore) std.mem.Allocator.Error!void {
                     const ctx = context orelse unreachable;
+                    const adam: *Adam = @ptrCast(@alignCast(data));
 
-                    var mvPtr = adam.data.ptr;
                     const b1 = adam.b1;
                     const b2 = adam.b2;
                     const ib1 = 1 - adam.b1;
                     const ib2 = 1 - adam.b2;
-                    const params = ctx.parameterPack.items[adam.parameterBegin .. adam.parameterBegin + adam.parameterLen];
-                    const grads = ctx.parameterGradPack.items[adam.parameterBegin .. adam.parameterBegin + adam.parameterLen];
                     const lr = adam.learningRate;
                     const e = adam.epsilon;
                     adam.step += 1.0;
                     const ibt1 = 1 - std.math.pow(f32, b1, adam.step);
                     const ibt2 = 1 - std.math.pow(f32, b2, adam.step);
 
-                    for (params, grads) |*param, grad| {
-                        var m = mvPtr[0];
-                        m = b1 * m + ib1 * grad;
-                        mvPtr[0] = m;
-                        mvPtr += 1;
-                        var v = mvPtr[0];
-                        v = b2 * v + ib2 * (grad * grad);
-                        mvPtr[0] = v;
-                        mvPtr += 1;
-                        const res = lr * (m / ibt1) / (std.math.sqrt(v / ibt2) + e);
-                        param.* -= res;
+                    for (stores) |store| {
+                        const sd = store.data();
+                        const parameterLen = sd.data.items.len;
+                        if (sd.train.items.len == 0) {
+                            try sd.train.resize(ctx.gpa, parameterLen * 2);
+                            @memset(sd.train.items, 0.0);
+                        } else {
+                            std.debug.assert(sd.train.items.len == parameterLen * 2); // parameter length changed
+                        }
+                        var mvPtr = sd.train.items.ptr;
+                        const params = sd.data.items;
+                        const grads = sd.grad.items;
+
+                        for (params, grads) |*param, grad| {
+                            var m = mvPtr[0];
+                            m = b1 * m + ib1 * grad;
+                            mvPtr[0] = m;
+                            mvPtr += 1;
+                            var v = mvPtr[0];
+                            v = b2 * v + ib2 * (grad * grad);
+                            mvPtr[0] = v;
+                            mvPtr += 1;
+                            const res = lr * (m / ibt1) / (std.math.sqrt(v / ibt2) + e);
+                            param.* -= res;
+                        }
                     }
                 }
             };
@@ -348,24 +429,60 @@ pub const Optimizer = struct {
         }
     };
 
-    pub fn optimize(opt: Optimizer) void {
-        opt.optimizeFn(opt.data);
+    pub fn optimize(opt: Optimizer, stores: []const TensorStore) !void {
+        return opt.optimizeFn(opt.data, stores);
     }
+};
+
+pub const NetworkOptions = struct {
+    // dirty state if it's true
+    noInitialize: bool = false,
+
+    store: TensorStore = TensorStore.network,
 };
 
 pub fn Network(T: type) type {
     return struct {
-        parameterBegin: u32,
+        parameter: TensorPointer,
         parameterLen: u32,
-        implement: *const fn (xs: Tensor) anyerror!Tensor,
+        implement: *const fn (xs: Tensor) std.mem.Allocator.Error!Tensor,
         data: T,
+
+        fn init(ctx: *Context, opts: NetworkOptions) !@This() {
+            const scope = TensorScope.save();
+            defer scope.restore();
+
+            const xs, _ = try ctx.createRawTensor(TensorStore.def, T.inputLen, 1);
+            const store = opts.store;
+            const sd = store.data();
+            const parameterIdx: u32 = @intCast(sd.data.items.len);
+            ctx.parameterCursor = parameterIdx;
+            const oldStore = ctx.parameterStore;
+            defer ctx.parameterStore = oldStore;
+            ctx.parameterStore = store;
+            ctx.history.clearRetainingCapacity();
+
+            if (!opts.noInitialize) ctx.initRequested = true;
+            defer ctx.initRequested = false;
+            _ = try T.forward(xs);
+            const parameterLen: u32 = @intCast(sd.data.items.len - parameterIdx);
+
+            return .{
+                .parameter = .{
+                    .store = store,
+                    .dataIdx = parameterIdx,
+                },
+                .parameterLen = parameterLen,
+                .implement = T.forward,
+                .data = .{},
+            };
+        }
 
         pub fn deinit(n: *@This()) void {
             n.* = undefined;
         }
 
-        pub fn predict(n: *@This(), input: []const f32) ![]f32 {
-            const ctx = context orelse unreachable;
+        pub fn predict(n: *@This(), input: []const f32) ![]const f32 {
             if (input.len == 0) {
                 return &.{};
             }
@@ -374,7 +491,8 @@ pub fn Network(T: type) type {
             defer scope.restore();
 
             const batchLen: u32 = @intCast(input.len / T.inputLen);
-            const xs = try ctx.createTensor(input, T.inputLen, batchLen);
+            const xs, const dest = try TensorStore.def.createUndef(T.inputLen, batchLen);
+            @memcpy(dest, input);
             const ys = try n.predictWithTensor(xs);
             return ys.plainData();
         }
@@ -383,11 +501,14 @@ pub fn Network(T: type) type {
             const ctx = context orelse unreachable;
             if (xs.dataLen != T.inputLen) return Error.SizeMismatch;
 
-            ctx.parameterCursor = n.parameterBegin;
+            ctx.parameterCursor = n.parameter.dataIdx;
+            const oldStore = ctx.parameterStore;
+            defer ctx.parameterStore = oldStore;
+            ctx.parameterStore = n.parameter.store;
             ctx.history.clearRetainingCapacity();
 
             const ys = try n.implement(xs);
-            const parameterLen: u32 = @intCast(ctx.parameterPack.items.len - n.parameterBegin);
+            const parameterLen: u32 = @intCast(n.parameter.store.data().data.items.len - n.parameter.dataIdx);
             std.debug.assert(parameterLen == n.parameterLen);
             return ys;
         }
@@ -399,19 +520,20 @@ pub fn Network(T: type) type {
             const ys = try n.predictWithTensor(xs);
             const loss = try ys.l2Loss(labels);
             try loss.backward(&.{1.0});
-            optimizer.optimize();
+            try optimizer.optimize(&.{
+                n.parameter.store,
+            });
             return loss;
         }
 
         pub fn train(n: *@This(), data: []const DataPair, epoch: u32, optimizer: Optimizer) !void {
-            const ctx = context orelse unreachable;
             if (data.len == 0) return;
 
             const scope = TensorScope.save();
             defer scope.restore();
 
-            const xs = try ctx.generateInputTensor(data);
-            const labels = try ctx.generateLabelTensor(data);
+            const xs = try Tensor.collectInputsOf(data);
+            const labels = try Tensor.collectLabelsOf(data);
 
             var lossSum: f32 = 0;
             var printedStep: u32 = 0;
@@ -441,26 +563,12 @@ pub fn Network(T: type) type {
             }
         }
 
-        pub fn randomInitialize(n: *@This()) !void {
-            const ctx = context orelse unreachable;
-            ctx.initRequested = true;
-            defer ctx.initRequested = false;
-
-            const scope = TensorScope.save();
-            defer scope.restore();
-
-            const xs, _ = try ctx.createDirtyTensor(T.inputLen, 1);
-            _ = try n.predictWithTensor(xs);
-        }
-
         pub fn parameters(n: *@This()) []f32 {
-            const ctx = context orelse unreachable;
-            return ctx.parameterPack.items[n.parameterBegin .. n.parameterBegin + n.parameterLen];
+            return n.parameter.dataPtr()[0..n.parameterLen];
         }
         pub fn parameterGradients(n: *@This()) []f32 {
-            const ctx = context orelse unreachable;
-            std.debug.assert(ctx.parameterGradPack.items.len >= n.parameterBegin + n.parameterLen); // backward required
-            return ctx.parameterGradPack.items[n.parameterBegin .. n.parameterBegin + n.parameterLen];
+            n.parameter.assertGradient(n.parameterLen);
+            return n.parameter.gradientPtr()[0..n.parameterLen];
         }
     };
 }
@@ -468,31 +576,37 @@ pub fn Network(T: type) type {
 pub const Error = error{SizeMismatch};
 
 pub const Tensor = struct {
-    dataIdx: u32,
+    ptr: TensorPointer,
     dataLen: u32,
     batchStride: u32,
     batchLen: u32,
 
     pub fn init(values: []const f32, dataLen: u32, batchLen: u32) !Tensor {
-        const ctx = context orelse unreachable;
-        return ctx.createTensor(values, dataLen, batchLen);
+        const out, const dest = try TensorStore.def.createUndef(dataLen, batchLen);
+        @memcpy(dest, values);
+        return out;
     }
     pub fn initUndef(dataLen: u32, batchLen: u32) !struct { Tensor, []f32 } {
-        const ctx = context orelse unreachable;
-        return ctx.createDirtyTensor(dataLen, batchLen);
+        return TensorStore.def.createUndef(dataLen, batchLen);
     }
     pub fn dataPtr(t: Tensor) [*]f32 {
-        const ctx = context orelse unreachable;
-        return ctx.dataPack.items.ptr + t.dataIdx;
+        return t.ptr.dataPtr();
     }
     fn assertGradient(t: Tensor) void {
-        const ctx = context orelse unreachable;
-        std.debug.assert(ctx.dataGradPack.items.len >= t.dataIdx + t.dataLen); // backward required
+        t.ptr.assertGradient(t.batchStride * t.batchLen);
+    }
+    pub fn collectLabelsOf(dataPair: []const DataPair) !Tensor {
+        return TensorStore.def.collectLabelsOf(dataPair);
+    }
+    pub fn collectInputsOf(dataPair: []const DataPair) !Tensor {
+        return TensorStore.def.collectInputsOf(dataPair);
     }
     pub fn gradientPtr(t: Tensor) [*]f32 {
         t.assertGradient();
-        const ctx = context orelse unreachable;
-        return ctx.dataGradPack.items.ptr + t.dataIdx;
+        return t.ptr.gradientPtr();
+    }
+    pub fn gradDataOffset(t: Tensor) GradDataOffset {
+        return t.ptr.store.data().gradDataOffset();
     }
     pub fn dataWalker(t: Tensor) StrideWalker {
         return .init(t.dataPtr(), t.dataLen, t.batchStride, t.batchLen);
@@ -508,7 +622,10 @@ pub const Tensor = struct {
         t.assertGradient();
         return .init(t.gradientPtr(), t.dataLen, t.batchStride, t.batchLen);
     }
-    pub fn plainData(t: Tensor) ![]f32 {
+
+    // it possibly returns a temporal slice
+    pub fn plainData(t: Tensor) ![]const f32 {
+        const ctx = context orelse unreachable;
         if (t.batchLen == 1) {
             return t.dataPtr()[0..t.dataLen];
         }
@@ -516,7 +633,7 @@ pub const Tensor = struct {
             return t.dataPtr()[0 .. t.batchStride * t.batchLen];
         }
 
-        _, const dest = try Tensor.initUndef(t.dataLen, t.batchLen);
+        const dest = try ctx.history.useTemporalCache(ctx.gpa, t.dataLen * t.batchLen);
         t.data().copyTo(dest.ptr);
         return dest;
     }
@@ -531,19 +648,14 @@ pub const Tensor = struct {
         const ctx = context orelse unreachable;
         std.debug.assert(t.dataLen * t.batchLen == grad.len); // size mismatch
 
-        try ctx.dataGradPack.resize(ctx.gpa, ctx.dataPack.items.len);
-        try ctx.parameterGradPack.resize(ctx.gpa, ctx.parameterPack.items.len);
-
-        @memset(ctx.dataGradPack.items, 0.0);
-        @memset(ctx.parameterGradPack.items, 0.0);
+        for (ctx.stores.items) |*store| {
+            try store.grad.resize(ctx.gpa, store.data.items.len);
+            @memset(store.grad.items, 0.0);
+        }
 
         var dest = t.gradient();
         dest.copyFrom(grad.ptr);
-
-        while (ctx.history.items.len > 0) {
-            const backFn = readHistory(BackwardFn);
-            backFn();
-        }
+        ctx.history.execute();
     }
     pub fn subarray(t: Tensor, begin: u32, end: u32) Tensor {
         std.debug.assert(end <= t.dataLen);
@@ -561,7 +673,7 @@ pub const Tensor = struct {
     ) !void {
         return t.data().format(writer);
     }
-    fn testingApproxEq(t: Tensor, expected: []const f32) !void {
+    pub fn testingApproxEq(t: Tensor, expected: []const f32) !void {
         return t.data().testingApproxEq(expected);
     }
 
@@ -570,7 +682,8 @@ pub const Tensor = struct {
         const xLen = xt.dataLen;
         const xStride = xt.batchStride;
         const weights = yLen * (xLen + 1);
-        const paramIdx = ctx.parameterCursor;
+
+        const param = ctx.parameterPtr();
         const ps: []f32 = try ctx.getParameters(weights);
         if (ctx.initRequested) {
             const inputLenF32: f32 = @floatFromInt(xLen);
@@ -582,7 +695,7 @@ pub const Tensor = struct {
         }
 
         const xs = xt.dataPtr();
-        const yt, const ys = try Tensor.initUndef(yLen, xt.batchLen);
+        const yt, const ys = try DefTensorPointer.initUndef(yLen * xt.batchLen);
 
         const pPtrEnd = ps.ptr + ps.len;
         var yPtr = ys.ptr;
@@ -605,17 +718,21 @@ pub const Tensor = struct {
                 yPtr += 1;
             }
         }
-        try writeHistory(LinearBackward{ .xt = xt, .yIdx = yt.dataIdx, .yLen = yt.dataLen, .paramIdx = paramIdx });
-        return yt;
+        try ctx.history.write(ctx.gpa, LinearBackward{
+            .xt = xt,
+            .yt = yt,
+            .yLen = yLen,
+            .param = param,
+        });
+        return yt.asTensor(yLen, yLen, xt.batchLen);
     }
     const LinearBackward = struct {
         xt: Tensor,
-        yIdx: u32,
+        yt: DefTensorPointer,
         yLen: u32,
-        paramIdx: u32,
+        param: TensorPointer,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
             const xs = b.xt.dataPtr();
             const gxs = b.xt.gradientPtr();
             const xLen = b.xt.dataLen;
@@ -624,14 +741,14 @@ pub const Tensor = struct {
             const xNext = xStride - xLen;
             const yLen = b.yLen;
             const batchLen = b.xt.batchLen;
-            const gys = ctx.dataGradPack.items.ptr + b.yIdx;
+            const gys = b.yt.gradientPtr();
             const gyEnd = gys + yLen * batchLen;
 
             var gyPtr = gys;
 
             // weight/bias grads
             {
-                const gps = ctx.parameterGradPack.items.ptr + b.paramIdx;
+                const gps = b.param.gradientPtr();
                 var gpPtr = gps;
                 const xRowEnd = xs + xLen;
                 const gyRowEnd = gys + yLen;
@@ -666,7 +783,7 @@ pub const Tensor = struct {
 
             // x grads
             const gxEnd = gxs + xStride * batchLen;
-            const ps = ctx.parameterPack.items.ptr + b.paramIdx;
+            const ps = b.param.dataPtr();
             var gxPtr = gxs;
             gyPtr = gys;
             while (@intFromPtr(gxPtr) < @intFromPtr(gxEnd)) {
@@ -692,6 +809,7 @@ pub const Tensor = struct {
         }
     };
     pub fn l2Loss(xt: Tensor, labelT: Tensor) !Tensor {
+        const ctx = context orelse unreachable;
         var out: f32 = 0;
         const xs = xt.dataPtr();
         const labels = labelT.dataPtr();
@@ -716,29 +834,30 @@ pub const Tensor = struct {
         const total: f32 = @floatFromInt(xt.dataLen * xt.batchLen);
         out /= total;
 
-        const outTensor = try Tensor.init(&.{out}, 1, 1);
-        try writeHistory(L2LossBackward{ .xt = xt, .labelT = labelT, .yIdx = outTensor.dataIdx });
-        return outTensor;
+        const yt, const ys = try DefTensorPointer.initUndef(1);
+        ys[0] = out;
+        try ctx.history.write(ctx.gpa, L2LossBackward{ .xt = xt, .labelT = labelT, .yt = yt });
+        return yt.asTensor(1, 1, 1);
     }
     const L2LossBackward = struct {
         xt: Tensor,
         labelT: Tensor,
-        yIdx: u32,
+        yt: DefTensorPointer,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
             var xWalker = b.xt.dataWalker();
             var labelWalker = b.labelT.dataWalker();
-            const gdo = ctx.gradDataOffset();
+            const xGdo = b.xt.ptr.store.data().gradDataOffset();
+            const labelGdo = b.labelT.ptr.store.data().gradDataOffset();
             const total: f32 = @floatFromInt(b.xt.dataLen * b.xt.batchLen);
-            const gy = ctx.dataGradPack.items.ptr[b.yIdx];
+            const gy = b.yt.gradientPtr()[0];
             const c = gy * 2 / total;
 
             while (xWalker.next()) {
                 std.debug.assert(labelWalker.next());
                 const grad = (xWalker.ptr[0] - labelWalker.ptr[0]) * c;
-                gdo.ptr(xWalker.ptr)[0] += grad;
-                gdo.ptr(labelWalker.ptr)[0] -= grad;
+                xGdo.ptr(xWalker.ptr)[0] += grad;
+                labelGdo.ptr(labelWalker.ptr)[0] -= grad;
             }
         }
     };
@@ -746,27 +865,27 @@ pub const Tensor = struct {
     // mono
 
     pub fn neg(xt: Tensor) !Tensor {
+        const ctx = context orelse unreachable;
         var xWalker = xt.dataWalker();
-        const yt, const ys = try Tensor.initUndef(xt.dataLen, xt.batchLen);
+        const yt, const ys = try DefTensorPointer.initUndef(xt.dataLen * xt.batchLen);
         var yPtr = ys.ptr;
         while (xWalker.next()) {
             yPtr[0] = -xWalker.ptr[0];
             yPtr += 1;
         }
-        try writeHistory(NegBackward{
+        try ctx.history.write(ctx.gpa, NegBackward{
             .xt = xt,
-            .yIdx = yt.dataIdx,
+            .yt = yt,
         });
-        return yt;
+        return yt.asTensor(xt.dataLen, xt.dataLen, xt.batchLen);
     }
     const NegBackward = struct {
         xt: Tensor,
-        yIdx: u32,
+        yt: DefTensorPointer,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
             var gxWalker = b.xt.gradientWalker();
-            var gyPtr = ctx.dataGradPack.items.ptr + b.yIdx;
+            var gyPtr = b.yt.gradientPtr();
             while (gxWalker.next()) {
                 const gy = gyPtr[0];
                 gyPtr += 1;
@@ -775,28 +894,28 @@ pub const Tensor = struct {
         }
     };
     pub fn exp(xt: Tensor) !Tensor {
+        const ctx = context orelse unreachable;
         var xWalker = xt.dataWalker();
-        const yt, const ys = try Tensor.initUndef(xt.dataLen, xt.batchLen);
+        const yt, const ys = try DefTensorPointer.initUndef(xt.dataLen * xt.batchLen);
         var yPtr = ys.ptr;
         while (xWalker.next()) {
             yPtr[0] = std.math.exp(xWalker.ptr[0]);
             yPtr += 1;
         }
-        try writeHistory(ExpBackward{
+        try ctx.history.write(ctx.gpa, ExpBackward{
             .xt = xt,
-            .yIdx = yt.dataIdx,
+            .yt = yt,
         });
-        return yt;
+        return yt.asTensor(xt.dataLen, xt.dataLen, xt.batchLen);
     }
     const ExpBackward = struct {
         xt: Tensor,
-        yIdx: u32,
+        yt: DefTensorPointer,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
             var gxWalker = b.xt.gradientWalker();
-            var yPtr = ctx.dataPack.items.ptr + b.yIdx;
-            var gyPtr = ctx.dataGradPack.items.ptr + b.yIdx;
+            var yPtr = b.yt.dataPtr();
+            var gyPtr = b.yt.gradientPtr();
             while (gxWalker.next()) {
                 gxWalker.ptr[0] += yPtr[0] * gyPtr[0];
                 yPtr += 1;
@@ -808,34 +927,34 @@ pub const Tensor = struct {
     // bi
 
     pub fn add(x1t: Tensor, x2t: Tensor) !Tensor {
+        const ctx = context orelse unreachable;
         if (x1t.dataLen != x2t.dataLen) return Error.SizeMismatch;
         if (x1t.batchLen != x2t.batchLen) return Error.SizeMismatch;
         var x1Walker = x1t.dataWalker();
         var x2Walker = x2t.dataWalker();
-        const yt, const ys = try Tensor.initUndef(x1t.dataLen, x1t.batchLen);
+        const yt, const ys = try DefTensorPointer.initUndef(x1t.dataLen * x1t.batchLen);
         var yPtr = ys.ptr;
         while (x1Walker.next()) {
             _ = x2Walker.next();
             yPtr[0] = x1Walker.ptr[0] + x2Walker.ptr[0];
             yPtr += 1;
         }
-        try writeHistory(AddBackward{
+        try ctx.history.write(ctx.gpa, AddBackward{
             .x1t = x1t,
             .x2t = x2t,
-            .yIdx = yt.dataIdx,
+            .yt = yt,
         });
-        return yt;
+        return yt.asTensor(x1t.dataLen, x1t.dataLen, x1t.batchLen);
     }
     const AddBackward = struct {
         x1t: Tensor,
         x2t: Tensor,
-        yIdx: u32,
+        yt: DefTensorPointer,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
             var gx1Walker = b.x1t.gradientWalker();
             var gx2Walker = b.x2t.gradientWalker();
-            var gyPtr = ctx.dataGradPack.items.ptr + b.yIdx;
+            var gyPtr = b.yt.gradientPtr();
             while (gx1Walker.next()) {
                 _ = gx2Walker.next();
                 const gy = gyPtr[0];
@@ -847,34 +966,34 @@ pub const Tensor = struct {
         }
     };
     pub fn sub(x1t: Tensor, x2t: Tensor) !Tensor {
+        const ctx = context orelse unreachable;
         if (x1t.dataLen != x2t.dataLen) return Error.SizeMismatch;
         if (x1t.batchLen != x2t.batchLen) return Error.SizeMismatch;
         var x1Walker = x1t.dataWalker();
         var x2Walker = x2t.dataWalker();
-        const yt, const ys = try Tensor.initUndef(x1t.dataLen, x1t.batchLen);
+        const yt, const ys = try DefTensorPointer.initUndef(x1t.dataLen * x1t.batchLen);
         var yPtr = ys.ptr;
         while (x1Walker.next()) {
             _ = x2Walker.next();
             yPtr[0] = x1Walker.ptr[0] - x2Walker.ptr[0];
             yPtr += 1;
         }
-        try writeHistory(SubBackward{
+        try ctx.history.write(ctx.gpa, SubBackward{
             .x1t = x1t,
             .x2t = x2t,
-            .yIdx = yt.dataIdx,
+            .yt = yt,
         });
-        return yt;
+        return yt.asTensor(x1t.dataLen, x1t.dataLen, x1t.batchLen);
     }
     const SubBackward = struct {
         x1t: Tensor,
         x2t: Tensor,
-        yIdx: u32,
+        yt: DefTensorPointer,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
             var gx1Walker = b.x1t.gradientWalker();
             var gx2Walker = b.x2t.gradientWalker();
-            var gyPtr = ctx.dataGradPack.items.ptr + b.yIdx;
+            var gyPtr = b.yt.gradientPtr();
             while (gx1Walker.next()) {
                 _ = gx2Walker.next();
                 const gy = gyPtr[0];
@@ -886,116 +1005,119 @@ pub const Tensor = struct {
         }
     };
     pub fn mul(x1t: Tensor, x2t: Tensor) !Tensor {
+        const ctx = context orelse unreachable;
         if (x1t.dataLen != x2t.dataLen) return Error.SizeMismatch;
         if (x1t.batchLen != x2t.batchLen) return Error.SizeMismatch;
         var x1Walker = x1t.dataWalker();
         var x2Walker = x2t.dataWalker();
-        const yt, const ys = try Tensor.initUndef(x1t.dataLen, x1t.batchLen);
+        const yt, const ys = try DefTensorPointer.initUndef(x1t.dataLen * x1t.batchLen);
         var yPtr = ys.ptr;
         while (x1Walker.next()) {
             _ = x2Walker.next();
             yPtr[0] = x1Walker.ptr[0] * x2Walker.ptr[0];
             yPtr += 1;
         }
-        try writeHistory(MulBackward{
+        try ctx.history.write(ctx.gpa, MulBackward{
             .x1t = x1t,
             .x2t = x2t,
-            .yIdx = yt.dataIdx,
+            .yt = yt,
         });
-        return yt;
+        return yt.asTensor(x1t.dataLen, x1t.dataLen, x1t.batchLen);
     }
     const MulBackward = struct {
         x1t: Tensor,
         x2t: Tensor,
-        yIdx: u32,
+        yt: DefTensorPointer,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
             var x1Walker = b.x1t.dataWalker();
             var x2Walker = b.x2t.dataWalker();
-            const gdo = ctx.gradDataOffset();
-            var gyPtr = ctx.dataGradPack.items.ptr + b.yIdx;
+            const x1Gdo = b.x1t.gradDataOffset();
+            const x2Gdo = b.x2t.gradDataOffset();
+            var gyPtr = b.yt.gradientPtr();
             while (x1Walker.next()) {
                 _ = x2Walker.next();
                 const gy = gyPtr[0];
                 gyPtr += 1;
-                gdo.ptr(x1Walker.ptr)[0] += x2Walker.ptr[0] * gy;
-                gdo.ptr(x2Walker.ptr)[0] += x1Walker.ptr[0] * gy;
+                x1Gdo.ptr(x1Walker.ptr)[0] += x2Walker.ptr[0] * gy;
+                x2Gdo.ptr(x2Walker.ptr)[0] += x1Walker.ptr[0] * gy;
             }
         }
     };
     pub fn div(x1t: Tensor, x2t: Tensor) !Tensor {
+        const ctx = context orelse unreachable;
         if (x1t.dataLen != x2t.dataLen) return Error.SizeMismatch;
         if (x1t.batchLen != x2t.batchLen) return Error.SizeMismatch;
         var x1Walker = x1t.dataWalker();
         var x2Walker = x2t.dataWalker();
-        const yt, const ys = try Tensor.initUndef(x1t.dataLen, x1t.batchLen);
+        const yt, const ys = try DefTensorPointer.initUndef(x1t.dataLen * x1t.batchLen);
         var yPtr = ys.ptr;
         while (x1Walker.next()) {
             _ = x2Walker.next();
             yPtr[0] = x1Walker.ptr[0] / x2Walker.ptr[0];
             yPtr += 1;
         }
-        try writeHistory(DivBackward{
+        try ctx.history.write(ctx.gpa, DivBackward{
             .x1t = x1t,
             .x2t = x2t,
-            .yIdx = yt.dataIdx,
+            .yt = yt,
         });
-        return yt;
+        return yt.asTensor(x1t.dataLen, x1t.dataLen, x1t.batchLen);
     }
     const DivBackward = struct {
         x1t: Tensor,
         x2t: Tensor,
-        yIdx: u32,
+        yt: DefTensorPointer,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
             var x1Walker = b.x1t.dataWalker();
             var x2Walker = b.x2t.dataWalker();
-            const gdo = ctx.gradDataOffset();
-            var gyPtr = ctx.dataGradPack.items.ptr + b.yIdx;
+            const x1Gdo = b.x1t.gradDataOffset();
+            const x2Gdo = b.x2t.gradDataOffset();
+            var gyPtr = b.yt.gradientPtr();
             while (x1Walker.next()) {
                 _ = x2Walker.next();
                 const gy = gyPtr[0];
                 gyPtr += 1;
 
                 const x2 = x2Walker.ptr[0];
-                gdo.ptr(x1Walker.ptr)[0] += gy / x2;
-                gdo.ptr(x2Walker.ptr)[0] += gy * -x1Walker.ptr[0] / (x2 * x2);
+                x1Gdo.ptr(x1Walker.ptr)[0] += gy / x2;
+                x2Gdo.ptr(x2Walker.ptr)[0] += gy * -x1Walker.ptr[0] / (x2 * x2);
             }
         }
     };
     pub fn pow(x1t: Tensor, x2t: Tensor) !Tensor {
+        const ctx = context orelse unreachable;
         if (x1t.dataLen != x2t.dataLen) return Error.SizeMismatch;
         if (x1t.batchLen != x2t.batchLen) return Error.SizeMismatch;
         var x1Walker = x1t.dataWalker();
         var x2Walker = x2t.dataWalker();
-        const yt, const ys = try Tensor.initUndef(x1t.dataLen, x1t.batchLen);
+        const yt, const ys = try DefTensorPointer.initUndef(x1t.dataLen * x1t.batchLen);
         var yPtr = ys.ptr;
         while (x1Walker.next()) {
             _ = x2Walker.next();
             yPtr[0] = std.math.pow(f32, x1Walker.ptr[0], x2Walker.ptr[0]);
             yPtr += 1;
         }
-        try writeHistory(PowBackward{
+        try ctx.history.write(ctx.gpa, PowBackward{
             .x1t = x1t,
             .x2t = x2t,
-            .yIdx = yt.dataIdx,
+            .yt = yt,
         });
-        return yt;
+        return yt.asTensor(x1t.dataLen, x1t.dataLen, x1t.batchLen);
     }
     const PowBackward = struct {
         x1t: Tensor,
         x2t: Tensor,
-        yIdx: u32,
+        yt: DefTensorPointer,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
             var x1Walker = b.x1t.dataWalker();
             var x2Walker = b.x2t.dataWalker();
-            const gdo = ctx.gradDataOffset();
-            var yPtr = ctx.dataPack.items.ptr + b.yIdx;
-            var gyPtr = ctx.dataGradPack.items.ptr + b.yIdx;
+            const x1Gdo = b.x1t.gradDataOffset();
+            const x2Gdo = b.x2t.gradDataOffset();
+            var yPtr = b.yt.dataPtr();
+            var gyPtr = b.yt.gradientPtr();
             while (x1Walker.next()) {
                 _ = x2Walker.next();
                 const gy = gyPtr[0];
@@ -1006,17 +1128,18 @@ pub const Tensor = struct {
                 const y = yPtr[0];
                 yPtr += 1;
 
-                gdo.ptr(x1Walker.ptr)[0] += y * x2 / x1 * gy;
-                gdo.ptr(x2Walker.ptr)[0] += y * @log(x1) * gy;
+                x1Gdo.ptr(x1Walker.ptr)[0] += y * x2 / x1 * gy;
+                x2Gdo.ptr(x2Walker.ptr)[0] += y * @log(x1) * gy;
             }
         }
     };
     pub fn dot(x1t: Tensor, x2t: Tensor) !Tensor {
+        const ctx = context orelse unreachable;
         if (x1t.dataLen != x2t.dataLen) return Error.SizeMismatch;
         if (x1t.batchLen != x2t.batchLen) return Error.SizeMismatch;
         var x1Walker = x1t.dataWalkerRow();
         var x2Walker = x2t.dataWalkerRow();
-        const yt, const ys = try Tensor.initUndef(1, x1t.batchLen);
+        const yt, const ys = try DefTensorPointer.initUndef(x1t.batchLen);
 
         var yPtr = ys.ptr;
         while (x1Walker.next()) |x1row| {
@@ -1030,31 +1153,31 @@ pub const Tensor = struct {
             yPtr += 1;
         }
 
-        try writeHistory(DotBackward{
+        try ctx.history.write(ctx.gpa, DotBackward{
             .x1t = x1t,
             .x2t = x2t,
-            .yIdx = yt.dataIdx,
+            .yt = yt,
         });
-        return yt;
+        return yt.asTensor(1, 1, x1t.batchLen);
     }
     const DotBackward = struct {
         x1t: Tensor,
         x2t: Tensor,
-        yIdx: u32,
+        yt: DefTensorPointer,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
             var x1Walker = b.x1t.dataWalkerRow();
             var x2Walker = b.x2t.dataWalkerRow();
-            const gdo = ctx.gradDataOffset();
-            var gyPtr = ctx.dataGradPack.items.ptr + b.yIdx;
+            const x1Gdo = b.x1t.gradDataOffset();
+            const x2Gdo = b.x2t.gradDataOffset();
+            var gyPtr = b.yt.gradientPtr();
             while (x1Walker.next()) |x1row| {
                 const x2row = x2Walker.next().?;
 
                 const gy = gyPtr[0];
                 gyPtr += 1;
 
-                for (x1row, x2row, gdo.slice(x1row), gdo.slice(x2row)) |x1, x2, *gx1, *gx2| {
+                for (x1row, x2row, x1Gdo.slice(x1row), x2Gdo.slice(x2row)) |x1, x2, *gx1, *gx2| {
                     gx1.* += gy * x2;
                     gx2.* += gy * x1;
                 }
@@ -1062,8 +1185,9 @@ pub const Tensor = struct {
         }
     };
     pub fn sum(xt: Tensor) !Tensor {
+        const ctx = context orelse unreachable;
         var xWalker = xt.dataWalkerRow();
-        const yt, const ys = try Tensor.initUndef(1, xt.batchLen);
+        const yt, const ys = try DefTensorPointer.initUndef(xt.batchLen);
 
         var yPtr = ys.ptr;
         while (xWalker.next()) |xrow| {
@@ -1075,20 +1199,19 @@ pub const Tensor = struct {
             yPtr += 1;
         }
 
-        try writeHistory(SumBackward{
+        try ctx.history.write(ctx.gpa, SumBackward{
             .xt = xt,
-            .yIdx = yt.dataIdx,
+            .yt = yt,
         });
-        return yt;
+        return yt.asTensor(1, 1, xt.batchLen);
     }
     const SumBackward = struct {
         xt: Tensor,
-        yIdx: u32,
+        yt: DefTensorPointer,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
             var gxWalker = b.xt.gradientWalkerRow();
-            var gyPtr = ctx.dataGradPack.items.ptr + b.yIdx;
+            var gyPtr = b.yt.gradientPtr();
             while (gxWalker.next()) |gxrow| {
                 const gy = gyPtr[0];
                 gyPtr += 1;
@@ -1099,8 +1222,9 @@ pub const Tensor = struct {
         }
     };
     pub fn mean(xt: Tensor) !Tensor {
+        const ctx = context orelse unreachable;
         var xWalker = xt.dataWalkerRow();
-        const yt, const ys = try Tensor.initUndef(1, xt.batchLen);
+        const yt, const ys = try DefTensorPointer.initUndef(xt.batchLen);
         const xLenF32: f32 = @floatFromInt(xt.dataLen);
 
         var yPtr = ys.ptr;
@@ -1113,21 +1237,20 @@ pub const Tensor = struct {
             yPtr += 1;
         }
 
-        try writeHistory(MeanBackward{
+        try ctx.history.write(ctx.gpa, MeanBackward{
             .xt = xt,
-            .yIdx = yt.dataIdx,
+            .yt = yt,
         });
-        return yt;
+        return yt.asTensor(1, 1, xt.batchLen);
     }
     const MeanBackward = struct {
         xt: Tensor,
-        yIdx: u32,
+        yt: DefTensorPointer,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
             const xLenF32: f32 = @floatFromInt(b.xt.dataLen);
             var gxWalker = b.xt.gradientWalkerRow();
-            var gyPtr = ctx.dataGradPack.items.ptr + b.yIdx;
+            var gyPtr = b.yt.gradientPtr();
             while (gxWalker.next()) |gxrow| {
                 const gy = gyPtr[0] / xLenF32;
                 gyPtr += 1;
@@ -1140,7 +1263,8 @@ pub const Tensor = struct {
 
     // activations
     pub fn relu(xt: Tensor) !Tensor {
-        const out, const ys = try Tensor.initUndef(xt.dataLen, xt.batchLen);
+        const ctx = context orelse unreachable;
+        const yt, const ys = try DefTensorPointer.initUndef(xt.dataLen * xt.batchLen);
 
         var xWalker = xt.dataWalker();
         var yPtr = ys.ptr;
@@ -1153,32 +1277,32 @@ pub const Tensor = struct {
             }
             yPtr += 1;
         }
-        try writeHistory(ReluBackward{
+        try ctx.history.write(ctx.gpa, ReluBackward{
             .xt = xt,
-            .yIdx = out.dataIdx,
+            .yt = yt,
         });
-        return out;
+        return yt.asTensor(xt.dataLen, xt.dataLen, xt.batchLen);
     }
     const ReluBackward = struct {
         xt: Tensor,
-        yIdx: u32,
+        yt: DefTensorPointer,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
-            var gyPtr = ctx.dataGradPack.items.ptr + b.yIdx;
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
+            var gyPtr = b.yt.gradientPtr();
             var xWalker = b.xt.dataWalker();
-            const gbo = ctx.gradDataOffset();
+            const xGdo = b.xt.gradDataOffset();
 
             while (xWalker.next()) {
                 if (xWalker.ptr[0] > 0) {
-                    gbo.ptr(xWalker.ptr)[0] += gyPtr[0];
+                    xGdo.ptr(xWalker.ptr)[0] += gyPtr[0];
                 }
                 gyPtr += 1;
             }
         }
     };
     pub fn leakyRelu(xt: Tensor, alpha: f32) !Tensor {
-        const out, const ys = try Tensor.initUndef(xt.dataLen, xt.batchLen);
+        const ctx = context orelse unreachable;
+        const yt, const ys = try DefTensorPointer.initUndef(xt.dataLen * xt.batchLen);
 
         var xWalker = xt.dataWalker();
         var yPtr = ys.ptr;
@@ -1191,33 +1315,33 @@ pub const Tensor = struct {
             }
             yPtr += 1;
         }
-        try writeHistory(LeakyReluBackward{
+        try ctx.history.write(ctx.gpa, LeakyReluBackward{
             .xt = xt,
-            .yIdx = out.dataIdx,
+            .yt = yt,
             .alpha = alpha,
         });
-        return out;
+        return yt.asTensor(xt.dataLen, xt.dataLen, xt.batchLen);
     }
     const LeakyReluBackward = struct {
         xt: Tensor,
-        yIdx: u32,
+        yt: DefTensorPointer,
         alpha: f32,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
-            var gyPtr = ctx.dataGradPack.items.ptr + b.yIdx;
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
+            var gyPtr = b.yt.gradientPtr();
             var xWalker = b.xt.dataWalker();
-            const gbo = ctx.gradDataOffset();
+            const xGdo = b.xt.gradDataOffset();
 
             while (xWalker.next()) {
                 const gy = gyPtr[0];
-                gbo.ptr(xWalker.ptr)[0] += if (xWalker.ptr[0] > 0) gy else gy * b.alpha;
+                xGdo.ptr(xWalker.ptr)[0] += if (xWalker.ptr[0] > 0) gy else gy * b.alpha;
                 gyPtr += 1;
             }
         }
     };
     pub fn elu(xt: Tensor, alpha: f32) !Tensor {
-        const out, const ys = try Tensor.initUndef(xt.dataLen, xt.batchLen);
+        const ctx = context orelse unreachable;
+        const yt, const ys = try DefTensorPointer.initUndef(xt.dataLen * xt.batchLen);
 
         var xWalker = xt.dataWalker();
         var yPtr = ys.ptr;
@@ -1230,34 +1354,34 @@ pub const Tensor = struct {
             }
             yPtr += 1;
         }
-        try writeHistory(EluBackward{
+        try ctx.history.write(ctx.gpa, EluBackward{
             .xt = xt,
-            .yIdx = out.dataIdx,
+            .yt = yt,
             .alpha = alpha,
         });
-        return out;
+        return yt.asTensor(xt.dataLen, xt.dataLen, xt.batchLen);
     }
     const EluBackward = struct {
         xt: Tensor,
-        yIdx: u32,
+        yt: DefTensorPointer,
         alpha: f32,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
-            var gyPtr = ctx.dataGradPack.items.ptr + b.yIdx;
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
+            var gyPtr = b.yt.gradientPtr();
             var xWalker = b.xt.dataWalker();
-            const gbo = ctx.gradDataOffset();
+            const xGdo = b.xt.gradDataOffset();
 
             while (xWalker.next()) {
                 const gy = gyPtr[0];
                 const x = xWalker.ptr[0];
-                gbo.ptr(xWalker.ptr)[0] += if (x > 0) gy else std.math.exp(x) * gy * b.alpha;
+                xGdo.ptr(xWalker.ptr)[0] += if (x > 0) gy else std.math.exp(x) * gy * b.alpha;
                 gyPtr += 1;
             }
         }
     };
     pub fn sigmoid(xt: Tensor) !Tensor {
-        const out, const ys = try Tensor.initUndef(xt.dataLen, xt.batchLen);
+        const ctx = context orelse unreachable;
+        const yt, const ys = try DefTensorPointer.initUndef(xt.dataLen * xt.batchLen);
 
         var xWalker = xt.dataWalker();
         var yPtr = ys.ptr;
@@ -1274,20 +1398,19 @@ pub const Tensor = struct {
             // yPtr[0] = 1 / (1 + std.math.exp(x));
             yPtr += 1;
         }
-        try writeHistory(SigmoidBackward{
+        try ctx.history.write(ctx.gpa, SigmoidBackward{
             .xt = xt,
-            .yIdx = out.dataIdx,
+            .yt = yt,
         });
-        return out;
+        return yt.asTensor(xt.dataLen, xt.dataLen, xt.batchLen);
     }
     const SigmoidBackward = struct {
         xt: Tensor,
-        yIdx: u32,
+        yt: DefTensorPointer,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
-            var yPtr = ctx.dataPack.items.ptr + b.yIdx;
-            var gyPtr = ctx.dataGradPack.items.ptr + b.yIdx;
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
+            var yPtr = b.yt.dataPtr();
+            var gyPtr = b.yt.gradientPtr();
             var gxWalker = b.xt.gradientWalker();
 
             while (gxWalker.next()) {
@@ -1299,7 +1422,8 @@ pub const Tensor = struct {
         }
     };
     pub fn tanh(xt: Tensor) !Tensor {
-        const out, const ys = try Tensor.initUndef(xt.dataLen, xt.batchLen);
+        const ctx = context orelse unreachable;
+        const yt, const ys = try DefTensorPointer.initUndef(xt.dataLen * xt.batchLen);
 
         var xWalker = xt.dataWalker();
         var yPtr = ys.ptr;
@@ -1308,20 +1432,19 @@ pub const Tensor = struct {
             yPtr[0] = std.math.tanh(xWalker.ptr[0]);
             yPtr += 1;
         }
-        try writeHistory(TanhBackward{
+        try ctx.history.write(ctx.gpa, TanhBackward{
             .xt = xt,
-            .yIdx = out.dataIdx,
+            .yt = yt,
         });
-        return out;
+        return yt.asTensor(xt.dataLen, xt.dataLen, xt.batchLen);
     }
     const TanhBackward = struct {
         xt: Tensor,
-        yIdx: u32,
+        yt: DefTensorPointer,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
-            var yPtr = ctx.dataPack.items.ptr + b.yIdx;
-            var gyPtr = ctx.dataGradPack.items.ptr + b.yIdx;
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
+            var yPtr = b.yt.dataPtr();
+            var gyPtr = b.yt.gradientPtr();
             var gxWalker = b.xt.gradientWalker();
 
             while (gxWalker.next()) {
@@ -1334,12 +1457,12 @@ pub const Tensor = struct {
     };
     pub fn softmax(xt: Tensor) !Tensor {
         const ctx = context orelse unreachable;
-        const out, const ys = try Tensor.initUndef(xt.dataLen, xt.batchLen);
+        const yt, const ys = try DefTensorPointer.initUndef(xt.dataLen * xt.batchLen);
 
         const scope = TensorScope.save();
         defer scope.restore();
 
-        _, const xsExp = try ctx.createDirtyCache(xt.dataLen);
+        const xsExp = try ctx.history.useTemporalCache(ctx.gpa, xt.dataLen);
 
         var sumVal: f32 = 0;
         var xWalker = xt.dataWalkerRow();
@@ -1358,21 +1481,21 @@ pub const Tensor = struct {
             }
         }
 
-        try writeHistory(SoftmaxBackward{
+        try ctx.history.write(ctx.gpa, SoftmaxBackward{
             .xt = xt,
-            .yIdx = out.dataIdx,
+            .yt = yt,
         });
-        return out;
+        return yt.asTensor(xt.dataLen, xt.dataLen, xt.batchLen);
     }
     const SoftmaxBackward = struct {
         xt: Tensor,
-        yIdx: u32,
+        yt: DefTensorPointer,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
-            const ys = ctx.dataPack.items.ptr + b.yIdx;
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
+            const ys = b.yt.dataPtr();
 
-            const gdo = ctx.gradDataOffset();
+            const xGdo = b.xt.gradDataOffset();
+            const yGdo = TensorStore.def.data().gradDataOffset();
             var yPtr = ys;
 
             var gxWalker = b.xt.gradientWalkerRow();
@@ -1381,12 +1504,12 @@ pub const Tensor = struct {
                 const yRowEnd = yPtr + b.xt.dataLen;
                 var sumVal: f32 = 0.0;
                 while (@intFromPtr(yPtr) < @intFromPtr(yRowEnd)) {
-                    sumVal += gdo.ptr(yPtr)[0] * yPtr[0];
+                    sumVal += xGdo.ptr(yPtr)[0] * yPtr[0];
                     yPtr += 1;
                 }
                 yPtr = yRowBegin;
                 for (gxRow) |*gx| {
-                    gx.* = (gdo.ptr(yPtr)[0] - sumVal) * yPtr[0];
+                    gx.* = (yGdo.ptr(yPtr)[0] - sumVal) * yPtr[0];
                     yPtr += 1;
                 }
             }
@@ -1395,12 +1518,12 @@ pub const Tensor = struct {
     const geluConstant: f32 = std.math.sqrt(2.0 / std.math.pi);
     pub fn gelu(xt: Tensor) !Tensor {
         const ctx = context orelse unreachable;
-        const out, const ys = try Tensor.initUndef(xt.dataLen, xt.batchLen);
+        const yt, const ys = try DefTensorPointer.initUndef(xt.dataLen * xt.batchLen);
 
         var xWalker = xt.dataWalker();
         var yPtr = ys.ptr;
 
-        const cacheIdx, const cache = try ctx.createDirtyCache(xt.dataLen * xt.batchLen);
+        const cache = try ctx.history.addManyCache(ctx.gpa, xt.dataLen * xt.batchLen);
 
         var cachePtr = cache.ptr;
         while (xWalker.next()) {
@@ -1411,29 +1534,27 @@ pub const Tensor = struct {
             yPtr += 1;
             cachePtr += 1;
         }
-        try writeHistory(GeluBackward{
+        try ctx.history.write(ctx.gpa, GeluBackward{
             .xt = xt,
-            .yIdx = out.dataIdx,
-            .cacheIdx = cacheIdx,
+            .yt = yt,
         });
-        return out;
+        return yt.asTensor(xt.dataLen, xt.dataLen, xt.batchLen);
     }
     const GeluBackward = struct {
         xt: Tensor,
-        yIdx: u32,
-        cacheIdx: u32,
+        yt: DefTensorPointer,
 
-        fn backward(b: @This()) void {
-            const ctx = context orelse unreachable;
-            var gyPtr = ctx.dataGradPack.items.ptr + b.yIdx;
-            var cachePtr = ctx.cachePack.items.ptr + b.cacheIdx;
+        fn backward(b: *@This(), history: *HistoryBuffer) void {
+            const total = b.xt.dataLen * b.xt.batchLen;
+            var cachePtr = history.readCache(total).ptr;
+            var gyPtr = b.yt.gradientPtr();
             var xWalker = b.xt.dataWalker();
-            const gbo = ctx.gradDataOffset();
+            const xGdo = b.xt.gradDataOffset();
 
             while (xWalker.next()) {
                 const x = xWalker.ptr[0];
                 const t = cachePtr[0];
-                gbo.ptr(xWalker.ptr)[0] +=
+                xGdo.ptr(xWalker.ptr)[0] +=
                     0.5 * (1.0 + t) +
                     0.5 * x * (1.0 - t * t) *
                         geluConstant * (1.0 + 0.134145 * x * x);
@@ -1454,541 +1575,89 @@ pub const Tensor = struct {
     // TODO: max, min
 };
 
-fn u32count(T: type) usize {
-    return @divTrunc(@sizeOf(T) + @alignOf(u32) - 1, @alignOf(u32));
-}
-fn writeHistory(value: anytype) !void {
-    const T = @TypeOf(value);
+const HistoryBuffer = struct {
+    const Fn = *const fn (h: *HistoryBuffer) void;
 
-    const Impl = struct {
-        fn call() void {
-            const ctx = context orelse unreachable;
-            const offset = ctx.history.items.len - @sizeOf(T);
-            var valueSpace: T = undefined;
-            @memcpy(std.mem.asBytes(&valueSpace), ctx.history.items[offset..]);
-            ctx.history.items.len = offset;
-            return valueSpace.backward();
+    buf: std.ArrayList(u32),
+
+    pub const empty: HistoryBuffer = .{ .buf = .empty };
+
+    fn assertU32Safe(T: type) void {
+        if (@alignOf(T) < @alignOf(u32)) {
+            @compileError("alignment mismatch");
         }
-    };
+        if (@sizeOf(T) % @sizeOf(u32) != 0) {
+            @compileError("size mismatch");
+        }
+    }
+    fn u32len(T: type) usize {
+        return @divExact(@sizeOf(T), @sizeOf(u32));
+    }
+    fn u32ArrayMut(T: type, data: *T) *[u32len(T)]u32 {
+        assertU32Safe(T);
+        return @ptrCast(data);
+    }
+    fn u32Array(T: type, data: *const T) *const [u32len(T)]u32 {
+        assertU32Safe(T);
+        return @ptrCast(data);
+    }
 
-    const ctx = context orelse unreachable;
-    const buf = try ctx.history.addManyAsArray(ctx.gpa, @sizeOf(T) + @sizeOf(BackwardFn));
-    @memcpy(buf[0..@sizeOf(T)], std.mem.asBytes(&value));
-    const backf: BackwardFn = Impl.call;
-    @memcpy(buf[@sizeOf(T)..], std.mem.asBytes(&backf));
-}
-fn readHistory(T: type) T {
-    const ctx = context orelse unreachable;
-    const size = @sizeOf(T);
-    ctx.history.items.len -= size;
+    fn clearRetainingCapacity(history: *HistoryBuffer) void {
+        history.buf.clearRetainingCapacity();
+    }
+    fn deinit(history: *HistoryBuffer, gpa: std.mem.Allocator) void {
+        history.buf.deinit(gpa);
+        history.* = undefined;
+    }
+    fn useTemporalCache(history: *HistoryBuffer, gpa: std.mem.Allocator, len: usize) ![]f32 {
+        try history.buf.ensureTotalCapacity(gpa, history.buf.items.len + len);
+        const ptr: [*]f32 = @ptrCast(history.buf.items.ptr);
+        return (ptr + history.buf.items.len)[0..len];
+    }
+    fn addManyCache(history: *HistoryBuffer, gpa: std.mem.Allocator, len: usize) ![]f32 {
+        const out = try history.buf.addManyAsSlice(gpa, len);
+        const ptr: [*]f32 = @ptrCast(out.ptr);
+        return ptr[0..len];
+    }
+    fn readCache(history: *HistoryBuffer, len: usize) []f32 {
+        history.buf.items.len -= len;
+        const out: [*]f32 = @ptrCast(history.buf.items.ptr + history.buf.items.len);
+        return out[0..len];
+    }
+    fn write(history: *HistoryBuffer, gpa: std.mem.Allocator, value: anytype) !void {
+        const T = @TypeOf(value);
 
-    var out: T = undefined;
-    const src = ctx.history.items.ptr + ctx.history.items.len;
-    @memcpy(std.mem.asBytes(&out), src[0..size]);
-    return out;
-}
+        const Impl = struct {
+            fn call(h: *HistoryBuffer) void {
+                if (@alignOf(T) > @alignOf(u32)) {
+                    @compileError("invalid alignment");
+                }
+                const len = u32len(T);
+                h.buf.items.len -= len;
+                var v: *T = @ptrCast(h.buf.items.ptr + h.buf.items.len);
+                return v.backward(h);
+            }
+        };
 
-// tests
+        const buf = try history.buf.addManyAsArray(gpa, @divExact(@sizeOf(T) + @sizeOf(Fn), @sizeOf(u32)));
+        const slice = u32Array(T, &value);
+        @memcpy(buf[0..slice.len], slice);
+        const f: Fn = Impl.call;
+        @memcpy(buf[slice.len..], u32Array(Fn, &f));
+    }
+    fn read(history: *HistoryBuffer, T: type) T {
+        const size = @divExact(@sizeOf(T), @sizeOf(u32));
+        history.buf.items.len -= size;
 
-test {
-    _ = @import("stridewalker.zig");
-}
-
-const TestNet = struct {
-    pub const inputLen = 2;
-
-    pub fn forward(input: Tensor) !Tensor {
-        var tensor = input;
-        tensor = try tensor.linear(3);
-        return tensor;
+        var out: T = undefined;
+        const src = history.buf.items.ptr + history.buf.items.len;
+        @memcpy(u32ArrayMut(T, &out), src[0..size]);
+        return out;
+    }
+    fn execute(history: *HistoryBuffer) void {
+        while (history.buf.items.len > 0) {
+            const f = history.read(Fn);
+            f(history);
+        }
     }
 };
-
-const testSeed = 123123123;
-
-fn testingApproxEq(expected: []const f32, actual: []const f32) !void {
-    for (expected, actual) |e, a| {
-        try std.testing.expectApproxEqAbs(e, a, 0.0001);
-    }
-}
-
-test "mininet linear" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    var testNet = try ctx.initNetwork(TestNet);
-    @memcpy(testNet.parameters(), &[_]f32{ 0.7, 0.1, 0.2, 0.8, 0.3, 0.4, 0.9, 0.5, 0.6 });
-    try testingApproxEq(&.{ 1.2, 1.9, 2.6 }, try testNet.predict(&.{ 1, 2 }));
-    try testingApproxEq(&.{ 1.8, 3.3, 4.8 }, try testNet.predict(&.{ 3, 4 }));
-    try testingApproxEq(&.{ 1.2, 1.9, 2.6, 1.8, 3.3, 4.8 }, try testNet.predict(&.{ 1, 2, 3, 4 }));
-}
-
-test "mininet backward" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    var testNet = try ctx.initNetwork(TestNet);
-    @memcpy(testNet.parameters(), &[_]f32{ 0.7, 0.1, 0.2, 0.8, 0.3, 0.4, 0.9, 0.5, 0.6 });
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const xs = try Tensor.init(&.{ 1, 2, 3, 4 }, 2, 2);
-    const labels = try Tensor.init(&.{ 1, 2, 3, 4, 5, 6 }, 3, 2);
-    const ys = try testNet.predictWithTensor(xs);
-    const loss = try ys.l2Loss(labels);
-    try loss.backward(&.{1});
-
-    try ys.gradient().testingApproxEq(&.{ 0.2 / 3.0, -0.1 / 3.0, -0.4 / 3.0, -2.2 / 3.0, -1.7 / 3.0, -0.4 });
-    try testingApproxEq(&.{ -2.0 / 3.0, -6.4 / 3.0, -2.8, -0.6, -5.2 / 3.0, -7.0 / 3.0, -1.6 / 3.0, -4.0 / 3.0, -5.6 / 3.0 }, testNet.parameterGradients());
-    try xs.gradient().testingApproxEq(&.{ -0.07, -0.08, -1.33 / 3.0, -1.84 / 3.0 });
-}
-
-test "mininet neg" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const x = try Tensor.init(&.{ -2.0, 0.5, 1.0 }, 3, 1);
-    const y = try x.neg();
-
-    try y.testingApproxEq(&.{ 2.0, -0.5, -1.0 });
-
-    try y.backward(&.{ 1.0, 1.0, 1.0 });
-    try x.gradient().testingApproxEq(&.{ -1.0, -1.0, -1.0 });
-}
-
-test "mininet exp" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const x = try Tensor.init(&.{ 0.0, 1.0, 2.0 }, 3, 1);
-
-    const y = try x.exp();
-
-    try y.testingApproxEq(&.{
-        1.0,
-        std.math.e,
-        std.math.exp(2.0),
-    });
-
-    try y.backward(&.{ 1.0, 1.0, 1.0 });
-
-    try x.gradient().testingApproxEq(&.{
-        1.0,
-        std.math.e,
-        std.math.exp(2.0),
-    });
-}
-
-test "mininet add" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const x1 = try Tensor.init(&.{ 1.0, 2.0, 3.0 }, 3, 1);
-    const x2 = try Tensor.init(&.{ 10.0, 20.0, 30.0 }, 3, 1);
-
-    const y = try x1.add(x2);
-
-    try y.testingApproxEq(&.{ 11.0, 22.0, 33.0 });
-
-    try y.backward(&.{ 1.0, 1.0, 1.0 });
-
-    try x1.gradient().testingApproxEq(&.{ 1.0, 1.0, 1.0 });
-    try x2.gradient().testingApproxEq(&.{ 1.0, 1.0, 1.0 });
-}
-
-test "mininet sub" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const x1 = try Tensor.init(&.{ 5.0, 6.0, 7.0 }, 3, 1);
-    const x2 = try Tensor.init(&.{ 1.0, 2.0, 3.0 }, 3, 1);
-
-    const y = try x1.sub(x2);
-
-    try y.testingApproxEq(&.{ 4.0, 4.0, 4.0 });
-
-    try y.backward(&.{ 1.0, 1.0, 1.0 });
-
-    try x1.gradient().testingApproxEq(&.{ 1.0, 1.0, 1.0 });
-    try x2.gradient().testingApproxEq(&.{ -1.0, -1.0, -1.0 });
-}
-
-test "mininet mul" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const x1 = try Tensor.init(&.{ 2.0, 3.0, 4.0 }, 3, 1);
-    const x2 = try Tensor.init(&.{ 10.0, 20.0, 30.0 }, 3, 1);
-
-    const y = try x1.mul(x2);
-
-    try y.testingApproxEq(&.{ 20.0, 60.0, 120.0 });
-
-    try y.backward(&.{ 1.0, 1.0, 1.0 });
-
-    try x1.gradient().testingApproxEq(&.{ 10.0, 20.0, 30.0 });
-    try x2.gradient().testingApproxEq(&.{ 2.0, 3.0, 4.0 });
-}
-
-test "mininet div" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const x1 = try Tensor.init(&.{ 10.0, 20.0, 30.0 }, 3, 1);
-    const x2 = try Tensor.init(&.{ 2.0, 4.0, 5.0 }, 3, 1);
-
-    const y = try x1.div(x2);
-
-    try y.testingApproxEq(&.{ 5.0, 5.0, 6.0 });
-
-    try y.backward(&.{ 1.0, 1.0, 1.0 });
-
-    try x1.gradient().testingApproxEq(&.{ 0.5, 0.25, 0.2 });
-    try x2.gradient().testingApproxEq(&.{ -10.0 / 4.0, -20.0 / 16.0, -30.0 / 25.0 });
-}
-
-test "mininet pow" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const x1 = try Tensor.init(&.{ 2.0, 3.0, 4.0 }, 3, 1);
-    const x2 = try Tensor.init(&.{ 3.0, 2.0, 0.5 }, 3, 1);
-
-    const y = try x1.pow(x2);
-
-    try y.testingApproxEq(&.{
-        8.0,
-        9.0,
-        2.0,
-    });
-
-    try y.backward(&.{ 1.0, 1.0, 1.0 });
-
-    try x1.gradient().testingApproxEq(&.{
-        12.0,
-        6.0,
-        0.25,
-    });
-
-    try x2.gradient().testingApproxEq(&.{
-        8.0 * @log(2.0),
-        9.0 * @log(3.0),
-        2.0 * @log(4.0),
-    });
-}
-
-test "mininet dot" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const x1 = try Tensor.init(&.{ 1.0, 2.0, 3.0 }, 3, 1);
-    const x2 = try Tensor.init(&.{ 10.0, 20.0, 30.0 }, 3, 1);
-
-    const y = try x1.dot(x2);
-
-    try y.testingApproxEq(&.{140.0}); // 10 + 40 + 90
-
-    try y.backward(&.{1.0});
-
-    try x1.gradient().testingApproxEq(&.{ 10.0, 20.0, 30.0 });
-    try x2.gradient().testingApproxEq(&.{ 1.0, 2.0, 3.0 });
-}
-
-test "mininet sum" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const x = try Tensor.init(&.{ 1.0, 2.0, 3.0 }, 3, 1);
-    const y = try x.sum();
-
-    try y.testingApproxEq(&.{6.0});
-
-    try y.backward(&.{1.0});
-
-    try x.gradient().testingApproxEq(&.{ 1.0, 1.0, 1.0 });
-}
-
-test "mininet mean" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const x = try Tensor.init(&.{ 2.0, 4.0, 6.0 }, 3, 1);
-    const y = try x.mean();
-
-    try y.testingApproxEq(&.{4.0});
-
-    try y.backward(&.{1.0});
-
-    try x.gradient().testingApproxEq(&.{ 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0 });
-}
-
-test "mininet relu" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const x = try Tensor.init(&.{ -2.0, -0.5, 0.0, 1.5, 3.0 }, 5, 1);
-    const y = try x.relu();
-
-    try y.testingApproxEq(&.{ 0.0, 0.0, 0.0, 1.5, 3.0 });
-
-    try y.backward(&.{ 0.3, -1.2, 2.0, 0.8, -0.4 });
-
-    try x.gradient().testingApproxEq(&.{ 0.0, 0.0, 0.0, 0.8, -0.4 });
-}
-
-test "mininet elu" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const x = try Tensor.init(&.{ -1.0, 0.0, 1.0 }, 3, 1);
-
-    // alpha = 1.0
-    const y = try x.elu(1.0);
-
-    try y.testingApproxEq(&.{
-        -0.63212056, // exp(-1) - 1
-        0.0,
-        1.0,
-    });
-
-    try y.backward(&.{ 1.0, 1.0, 1.0 });
-
-    // derivative:
-    // x <= 0 : exp(x)
-    // x > 0  : 1
-    try x.gradient().testingApproxEq(&.{
-        0.36787945, // exp(-1)
-        1.0,
-        1.0,
-    });
-}
-
-test "mininet leakyrelu" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const alpha: f32 = 0.1;
-
-    const x = try Tensor.init(&.{ -2.0, -1.0, 0.0, 1.0, 3.0 }, 5, 1);
-    const y = try x.leakyRelu(alpha);
-
-    try y.testingApproxEq(&.{
-        -0.2, // -2 * 0.1
-        -0.1, // -1 * 0.1
-        0.0, // 0
-        1.0, // x
-        3.0, // x
-    });
-
-    try y.backward(&.{ 0.5, 1.0, -1.0, 0.3, -0.7 });
-
-    try x.gradient().testingApproxEq(&.{
-        0.05, // 0.5 * 0.1
-        0.1, // 1.0 * 0.1
-        -0.1, // -1.0 * 0.1
-        0.3, // 그대로
-        -0.7, // 그대로
-    });
-}
-
-test "mininet sigmoid" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const x = try Tensor.init(&.{ -2.0, 0.0, 2.0 }, 3, 1);
-    const y = try x.sigmoid();
-
-    // approximate values
-    try y.testingApproxEq(&.{
-        0.1192029,
-        0.5,
-        0.8807971,
-    });
-
-    try y.backward(&.{ 1.0, 1.0, 1.0 });
-
-    const ydata = try y.plainData();
-
-    try x.gradient().testingApproxEq(&.{
-        ydata[0] * (1 - ydata[0]),
-        ydata[1] * (1 - ydata[1]),
-        ydata[2] * (1 - ydata[2]),
-    });
-}
-
-test "mininet tanh" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const x = try Tensor.init(&.{ -2.0, 0.0, 2.0 }, 3, 1);
-    const y = try x.tanh();
-
-    try y.testingApproxEq(&.{
-        -0.9640276,
-        0.0,
-        0.9640276,
-    });
-
-    try y.backward(&.{ 1.0, 1.0, 1.0 });
-
-    const ydata = try y.plainData();
-
-    try x.gradient().testingApproxEq(&.{
-        1 - ydata[0] * ydata[0],
-        1 - ydata[1] * ydata[1],
-        1 - ydata[2] * ydata[2],
-    });
-}
-
-test "mininet softmax" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const x = try Tensor.init(&.{ 1.0, 2.0, 3.0 }, 3, 1);
-
-    const y = try x.softmax();
-
-    // exp(x) / sum(exp(x))
-    try y.testingApproxEq(&.{
-        0.09003057,
-        0.24472848,
-        0.66524094,
-    });
-
-    try y.backward(&.{ 1.0, 2.0, 3.0 });
-
-    // softmax backward:
-    // dX = Y * (dY - sum(dY * Y))
-    //
-    // dot =
-    // 1*y0 + 2*y1 + 3*y2
-    // = 2.57521031
-
-    try x.gradient().testingApproxEq(&.{
-        -0.1418171,
-        -0.1407704,
-        0.2825875,
-    });
-}
-
-test "mininet gelu" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const x = try Tensor.init(&.{ -1.0, 0.0, 1.0 }, 3, 1);
-
-    const y = try x.gelu();
-
-    try y.testingApproxEq(&.{
-        -0.158808,
-        0.0,
-        0.841192,
-    });
-
-    try y.backward(&.{ 1.0, 1.0, 1.0 });
-
-    // approximate GELU derivative
-    try x.gradient().testingApproxEq(&.{
-        -0.082964,
-        0.5,
-        1.082964,
-    });
-}
-
-test "mininet silu" {
-    var ctx = Context.init(std.testing.allocator, testSeed);
-    _ = ctx.set();
-    defer ctx.deinit();
-
-    const scope = TensorScope.save();
-    defer scope.restore();
-
-    const x = try Tensor.init(&.{ -1.0, 0.0, 1.0 }, 3, 1);
-
-    const y = try x.silu();
-
-    try y.testingApproxEq(&.{
-        -0.26894143,
-        0.0,
-        0.7310586,
-    });
-
-    try y.backward(&.{ 1.0, 1.0, 1.0 });
-
-    try x.gradient().testingApproxEq(&.{
-        0.07232949,
-        0.5,
-        0.92767054,
-    });
-}
