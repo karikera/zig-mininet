@@ -38,7 +38,7 @@ const mininet = @import("mininet");
 pub fn main(init: std.process.Init) !void {
     // initialize context
     var ctx = try mininet.Context.init(init.gpa, 24672672645);
-    _ = ctx.set();_
+    _ = ctx.set();
     defer ctx.deinit();
 
     // define network
