@@ -24,7 +24,7 @@ test {
 }
 
 test "mininet linear" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -36,7 +36,7 @@ test "mininet linear" {
 }
 
 test "mininet backward" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -58,7 +58,7 @@ test "mininet backward" {
 }
 
 test "mininet neg" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -72,7 +72,7 @@ test "mininet neg" {
 }
 
 test "mininet exp" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -96,7 +96,7 @@ test "mininet exp" {
 }
 
 test "mininet add" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -114,7 +114,7 @@ test "mininet add" {
 }
 
 test "mininet sub" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -132,7 +132,7 @@ test "mininet sub" {
 }
 
 test "mininet mul" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -150,7 +150,7 @@ test "mininet mul" {
 }
 
 test "mininet div" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -168,7 +168,7 @@ test "mininet div" {
 }
 
 test "mininet pow" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -199,7 +199,7 @@ test "mininet pow" {
 }
 
 test "mininet dot" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -217,7 +217,7 @@ test "mininet dot" {
 }
 
 test "mininet sum" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -232,7 +232,7 @@ test "mininet sum" {
 }
 
 test "mininet mean" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -247,7 +247,7 @@ test "mininet mean" {
 }
 
 test "mininet relu" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -262,7 +262,7 @@ test "mininet relu" {
 }
 
 test "mininet elu" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -290,7 +290,7 @@ test "mininet elu" {
 }
 
 test "mininet leakyrelu" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -319,7 +319,7 @@ test "mininet leakyrelu" {
 }
 
 test "mininet sigmoid" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -345,7 +345,7 @@ test "mininet sigmoid" {
 }
 
 test "mininet tanh" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -370,7 +370,7 @@ test "mininet tanh" {
 }
 
 test "mininet softmax" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -402,7 +402,7 @@ test "mininet softmax" {
 }
 
 test "mininet gelu" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -427,7 +427,7 @@ test "mininet gelu" {
 }
 
 test "mininet silu" {
-    var ctx = try mininet.Context.init(std.testing.allocator, testSeed);
+    var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
     defer ctx.deinit();
 

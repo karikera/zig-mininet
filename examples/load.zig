@@ -3,7 +3,7 @@ const mininet = @import("mininet");
 
 pub fn main(init: std.process.Init) !void {
     // initialize context
-    var ctx = try mininet.Context.init(init.gpa, 24672672645);
+    var ctx = try mininet.Context.init(init.gpa);
     _ = ctx.set();
     defer ctx.deinit();
 
@@ -17,7 +17,7 @@ pub fn main(init: std.process.Init) !void {
             tensor = try tensor.linear(1);
             return tensor;
         }
-    }, .{ .noInitialize = true });
+    }, .{});
     defer simpleNet.deinit();
 
     // load
