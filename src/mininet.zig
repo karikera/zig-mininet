@@ -441,6 +441,15 @@ pub const NetworkOptions = struct {
     store: TensorStore = TensorStore.network,
 };
 
+pub const TrainOptions = struct {
+    epoch: u32 = 1000,
+    batchSize: u32 = 64,
+    optimizer: Optimizer,
+
+    io: ?std.Io = null, // for printing loss and measureing the printing interval
+    stdout: ?*std.Io.Writer = null, // for printing loss.
+};
+
 pub fn Network(T: type) type {
     return struct {
         parameter: TensorPointer,
@@ -526,7 +535,70 @@ pub fn Network(T: type) type {
             return loss;
         }
 
-        pub fn train(n: *@This(), data: []const DataPair, epoch: u32, optimizer: Optimizer) !void {
+        pub fn trainWithTensor(n: *@This(), xs: Tensor, labels: Tensor, opts: TrainOptions) !void {
+            if (xs.batchLen == 0) return;
+            std.debug.assert(xs.batchLen == labels.batchLen);
+
+            var lossSum: f32 = 0;
+            var step: u32 = 0;
+            const stepPerEpoch = @divTrunc(xs.batchLen + opts.batchSize - 1, opts.batchSize);
+            const printStepInterval = @max((opts.epoch * stepPerEpoch + 5) / 10, 1);
+            const printDuraInterval = std.Io.Duration.fromSeconds(1);
+            var printedStep: u32 = 0;
+            var nextPrintedTime = if (opts.io) |io| std.Io.Clock.awake.now(io).addDuration(printDuraInterval) else undefined;
+
+            var failingWriter = std.Io.Writer.failing;
+            var stdoutFile: std.Io.File.Writer = undefined;
+            var stdout: *std.Io.Writer = undefined;
+            if (opts.stdout) |so| {
+                stdout = so;
+            } else if (opts.io) |io| {
+                stdoutFile = std.Io.File.stdout().writer(io, &.{});
+                stdout = &stdoutFile.interface;
+            } else {
+                stdout = &failingWriter;
+            }
+
+            for (0..opts.epoch) |_| {
+                var i: u32 = 0;
+                while (i < xs.batchLen) {
+                    const batchEnd = @min(i + opts.batchSize, xs.batchLen);
+                    const xBatch = xs.batchSubarray(i, batchEnd);
+                    const labelBatch = labels.batchSubarray(i, batchEnd);
+                    const loss = try n.trainOnceWithTensor(xBatch, labelBatch, opts.optimizer);
+                    lossSum += loss.dataPtr()[0];
+                    i += opts.batchSize;
+                    step += 1;
+
+                    var now: std.Io.Timestamp = undefined;
+                    if (opts.io) |io| {
+                        now = std.Io.Clock.awake.now(io);
+                    }
+
+                    const passedStep = step - printedStep;
+                    if (passedStep >= printStepInterval or now.durationTo(nextPrintedTime).nanoseconds <= 0) {
+                        if (opts.io) |_| {
+                            nextPrintedTime = now.addDuration(printDuraInterval);
+                        }
+                        printedStep = step;
+
+                        const lossSumCount: f32 = @floatFromInt(passedStep);
+                        const lossMean = lossSum / lossSumCount;
+                        lossSum = 0;
+                        stdout.print("[{}] Loss = {}\n", .{ step, lossMean }) catch {};
+                    }
+                }
+            }
+
+            const passedStep = step - printedStep;
+            if (passedStep > 0) {
+                const lossSumCount: f32 = @floatFromInt(passedStep);
+                const lossMean = lossSum / lossSumCount;
+                stdout.print("[{}] Loss = {}\n", .{ step, lossMean }) catch {};
+            }
+        }
+
+        pub fn train(n: *@This(), data: []const DataPair, opts: TrainOptions) !void {
             if (data.len == 0) return;
 
             const scope = TensorScope.save();
@@ -534,33 +606,7 @@ pub fn Network(T: type) type {
 
             const xs = try Tensor.collectInputsOf(data);
             const labels = try Tensor.collectLabelsOf(data);
-
-            var lossSum: f32 = 0;
-            var printedStep: u32 = 0;
-            var step: u32 = 0;
-            const sumMax = @max((epoch + 5) / 10, 1);
-
-            for (0..epoch) |_| {
-                const loss = try n.trainOnceWithTensor(xs, labels, optimizer);
-                lossSum += loss.dataPtr()[0];
-                step += 1;
-                const sumCount = step - printedStep;
-                if (sumCount >= sumMax) {
-                    const sumCountF: f32 = @floatFromInt(sumCount);
-                    printedStep = step;
-
-                    const lossMean = lossSum / sumCountF;
-                    lossSum = 0;
-                    std.debug.print("[{}] Loss = {}\n", .{ step, lossMean });
-                }
-            }
-
-            const sumCount = step - printedStep;
-            if (sumCount > 0) {
-                const sumCountF: f32 = @floatFromInt(sumCount);
-                const lossMean = lossSum / sumCountF;
-                std.debug.print("[{}] Loss = {}\n", .{ step, lossMean });
-            }
+            return n.trainWithTensor(xs, labels, opts);
         }
 
         pub fn parameters(n: *@This()) []f32 {
@@ -622,6 +668,18 @@ pub const Tensor = struct {
         t.assertGradient();
         return .init(t.gradientPtr(), t.dataLen, t.batchStride, t.batchLen);
     }
+    pub fn appendBatchIfLatest(t: *Tensor, batch: []const f32) !void {
+        std.debug.assert(t.dataLen == batch.len);
+        @memcpy(try t.addOneBatchIfLatest(), batch);
+    }
+    pub fn addOneBatchIfLatest(t: *Tensor) ![]f32 {
+        const ctx = context orelse unreachable;
+        const sd = t.ptr.store.data();
+        std.debug.assert(t.ptr.dataIdx + t.batchStride * t.batchLen == sd.data.items.len);
+        t.batchLen += 1;
+        const dest = try sd.data.addManyAsSlice(ctx.gpa, t.batchStride);
+        return dest[0..t.dataLen];
+    }
 
     // it possibly returns a temporal slice
     pub fn plainData(t: Tensor) ![]const f32 {
@@ -661,10 +719,26 @@ pub const Tensor = struct {
         std.debug.assert(end <= t.dataLen);
         std.debug.assert(begin <= end);
         return .{
-            .dataIdx = t.dataIdx + begin,
+            .ptr = .{
+                .store = t.ptr.store,
+                .dataIdx = t.ptr.dataIdx + begin,
+            },
             .dataLen = end - begin,
             .batchStride = t.batchStride,
             .batchLen = t.batchLen,
+        };
+    }
+    pub fn batchSubarray(t: Tensor, begin: u32, end: u32) Tensor {
+        std.debug.assert(end <= t.batchLen);
+        std.debug.assert(begin <= end);
+        return .{
+            .ptr = .{
+                .store = t.ptr.store,
+                .dataIdx = t.ptr.dataIdx + begin * t.batchStride,
+            },
+            .dataLen = t.dataLen,
+            .batchStride = t.batchStride,
+            .batchLen = end - begin,
         };
     }
     pub fn format(

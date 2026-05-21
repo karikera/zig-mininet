@@ -35,7 +35,7 @@ pub fn main(init: std.process.Init) !void {
     }, .{
         .input = &.{ 1.0, 1.0 },
         .label = &.{0.0},
-    } }, 500, opt.optimizer());
+    } }, .{ .optimizer = opt.optimizer(), .epoch = 500, .io = init.io });
 
     // save
     // try std.Io.Dir.cwd().writeFile(init.io, .{

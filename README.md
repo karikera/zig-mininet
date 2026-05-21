@@ -69,7 +69,7 @@ pub fn main(init: std.process.Init) !void {
     }, .{
         .input = &.{ 1.0, 1.0 },
         .label = &.{0.0},
-    } }, 1000, opt.optimizer());
+    } }, .{ .optimizer = opt.optimizer(), .epoch = 500, .io = init.io });
 
     // predict
     {
