@@ -38,6 +38,7 @@ pub fn build(b: *std.Build) !void {
     // example
     ctx.addExample("example-basic", "Run basic example", "examples/basic.zig");
     ctx.addExample("example-load", "Run load example", "examples/load.zig");
+    ctx.addExample("example-load-raw", "Run load-raw example", "examples/load_raw.zig");
 
     // test
     const test_filters = b.option(

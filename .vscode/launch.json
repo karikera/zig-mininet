@@ -27,6 +27,18 @@
       "environment": [],
       "console": "integratedTerminal",
       "preLaunchTask": "build mininet"
+    },
+    {
+      "name": "debug load raw",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/zig-out/bin/example-load-raw.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "console": "integratedTerminal",
+      "preLaunchTask": "build mininet"
     }
   ]
 }

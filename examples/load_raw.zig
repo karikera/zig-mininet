@@ -17,22 +17,13 @@ pub fn main(init: std.process.Init) !void {
             tensor = try tensor.linear(1);
             return tensor;
         }
-    }, .{});
+    }, .{
+        .rawParameters = &@import("load_raw_generated.zig").parameters,
+    });
     defer simpleNet.deinit();
 
-    // load
-    const parameters = try std.Io.Dir.cwd().readFileAlloc(init.io, "examples/load.bin", init.gpa, .unlimited);
-    @memcpy(std.mem.sliceAsBytes(simpleNet.parameters()), parameters);
-    init.gpa.free(parameters);
-
-    // save
-    // try std.Io.Dir.cwd().writeFile(init.io, .{
-    //     .data = std.mem.sliceAsBytes(simpleNet.parameters()),
-    //     .sub_path = "examples/load.bin",
-    // });
-
     // save as zig source
-    try simpleNet.parametersToZigFile(init.io, "examples/load_raw_generated.zig");
+    // try simpleNet.parametersToZigFile(init.io, "examples/generated_xor_params.zig");
 
     // predict
     {

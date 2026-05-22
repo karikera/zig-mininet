@@ -1,28 +1,41 @@
 const std = @import("std");
-const StrideWalker = @import("stridewalker.zig");
+const stridewalker = @import("stridewalker.zig");
+const StrideWalker = stridewalker.StrideWalker;
+const StrideWalkerMut = stridewalker.StrideWalkerMut;
+const StrideWalkerRow = stridewalker.StrideWalkerRow;
+const StrideWalkerRowMut = stridewalker.StrideWalkerRowMut;
 
 threadlocal var context: ?*Context = null;
 
 const TensorStoreData = struct {
     data: std.ArrayList(f32),
-    grad: std.ArrayList(f32),
-    train: std.ArrayList(f32),
+    grad: []f32,
+    train: []f32,
 
     pub const empty: TensorStoreData = .{
         .data = .empty,
-        .grad = .empty,
-        .train = .empty,
+        .grad = &.{},
+        .train = &.{},
     };
 
     pub fn deinit(store: *TensorStoreData, gpa: std.mem.Allocator) void {
         store.data.deinit(gpa);
-        store.grad.deinit(gpa);
-        store.train.deinit(gpa);
+        gpa.free(store.grad);
+        gpa.free(store.train);
         store.* = undefined;
     }
 
     fn gradDataOffset(store: *TensorStoreData) GradDataOffset {
-        return .{ .bytes = @intFromPtr(store.grad.items.ptr) -% @intFromPtr(store.data.items.ptr) };
+        return .{ .bytes = @intFromPtr(store.grad.ptr) -% @intFromPtr(store.data.items.ptr) };
+    }
+};
+
+const TensorStoreDataConst = struct {
+    data: []const f32,
+    grad: ?[*]f32,
+
+    fn gradDataOffset(store: *TensorStoreDataConst) GradDataOffset {
+        return .{ .bytes = @intFromPtr(store.grad) -% @intFromPtr(store.data.ptr) };
     }
 };
 
@@ -30,14 +43,49 @@ const TensorPointer = struct {
     store: TensorStore,
     dataIdx: u32,
 
-    pub fn dataPtr(tp: TensorPointer) [*]f32 {
-        return tp.store.data().data.items.ptr + tp.dataIdx;
+    pub fn dataPtrMut(tp: TensorPointer) [*]f32 {
+        return tp.store.dataPtrMut() + tp.dataIdx;
+    }
+    pub fn dataPtr(tp: TensorPointer) [*]const f32 {
+        return tp.store.dataPtr() + tp.dataIdx;
     }
     pub fn gradientPtr(tp: TensorPointer) [*]f32 {
-        return tp.store.data().grad.items.ptr + tp.dataIdx;
+        return tp.store.gradPtr() + tp.dataIdx;
     }
     pub fn assertGradient(tp: TensorPointer, len: usize) void {
-        std.debug.assert(tp.store.data().grad.items.len >= tp.dataIdx + len); // backward required
+        std.debug.assert(tp.store.gradLen() >= tp.dataIdx + len); // backward required
+    }
+    fn readParameters(tp: *TensorPointer, weights: u32) ![]const f32 {
+        const ctx = context orelse unreachable;
+        var params: []const f32 = undefined;
+        const off = ctx.parameterCursor.dataIdx;
+        const store = tp.store;
+        if (store.isConst()) {
+            const sd = &ctx.constStores.items[store.id >> 1];
+            params = sd.data[off .. off + weights];
+        } else {
+            const sd = &ctx.stores.items[store.id >> 1];
+            if (sd.data.items.len == ctx.parameterCursor.dataIdx) {
+                params = try sd.data.addManyAsSlice(ctx.gpa, weights);
+            } else {
+                params = sd.data.items[off .. off + weights];
+            }
+        }
+        ctx.parameterCursor.dataIdx += weights;
+        return params;
+    }
+    fn readMutParameters(tp: *TensorPointer, weights: u32) ![]f32 {
+        const ctx = context orelse unreachable;
+        var params: []f32 = undefined;
+        const off = ctx.parameterCursor.dataIdx;
+        const sd = tp.store.assumeMutStore();
+        if (sd.data.items.len == ctx.parameterCursor.dataIdx) {
+            params = try sd.data.addManyAsSlice(ctx.gpa, weights);
+        } else {
+            params = sd.data.items[off .. off + weights];
+        }
+        ctx.parameterCursor.dataIdx += weights;
+        return params;
     }
 };
 
@@ -46,7 +94,7 @@ const DefTensorPointer = struct {
 
     pub fn initUndef(totalLen: u32) !struct { DefTensorPointer, []f32 } {
         const ctx = context orelse unreachable;
-        const store = TensorStore.def.data();
+        const store = TensorStore.def.assumeMutStore();
         const dataIdx = store.data.items.len;
         return .{
             .{
@@ -56,13 +104,13 @@ const DefTensorPointer = struct {
         };
     }
     pub fn dataPtr(tp: DefTensorPointer) [*]f32 {
-        return TensorStore.def.data().data.items.ptr + tp.dataIdx;
+        return TensorStore.def.dataPtrMut() + tp.dataIdx;
     }
     pub fn gradientPtr(tp: DefTensorPointer) [*]f32 {
-        return TensorStore.def.data().grad.items.ptr + tp.dataIdx;
+        return TensorStore.def.gradPtr() + tp.dataIdx;
     }
     pub fn assertGradient(tp: DefTensorPointer, len: usize) void {
-        std.debug.assert(TensorStore.def.data().grad.items.len >= tp.dataIdx + len); // backward required
+        std.debug.assert(TensorStore.gradLen() >= tp.dataIdx + len); // backward required
     }
     pub fn asTensor(tp: DefTensorPointer, dataLen: u32, batchStride: u32, batchLen: u32) Tensor {
         return .{
@@ -80,6 +128,7 @@ const DefTensorPointer = struct {
 pub const Context = struct {
     gpa: std.mem.Allocator,
     stores: std.ArrayList(TensorStoreData),
+    constStores: std.ArrayList(TensorStoreDataConst),
     parameterCursor: TensorPointer,
     callStackLevelCheck: u16,
     initializer: ?std.Random,
@@ -93,6 +142,7 @@ pub const Context = struct {
         return .{
             .gpa = gpa,
             .stores = stores,
+            .constStores = .empty,
             .parameterCursor = undefined,
             .callStackLevelCheck = 0,
             .initializer = null,
@@ -109,7 +159,19 @@ pub const Context = struct {
             store.deinit(ctx.gpa);
         }
         ctx.stores.deinit(ctx.gpa);
+        for (ctx.constStores.items) |*store| {
+            if (store.grad) |grad| {
+                ctx.gpa.free(grad[0..store.data.len]);
+            }
+        }
+        ctx.constStores.deinit(ctx.gpa);
         ctx.* = undefined;
+    }
+    pub fn shrinkToFit(ctx: *Context) !void {
+        for (ctx.stores.items) |*store| {
+            store.data.shrinkToLen(ctx.gpa);
+        }
+        try ctx.stores.shrinkToLen(ctx.gpa);
     }
 
     // return false if already using
@@ -130,19 +192,10 @@ pub const Context = struct {
         }
     }
 
-    fn getParameters(ctx: *Context, weights: u32) ![]f32 {
-        var params: []f32 = undefined;
-        const store = &ctx.stores.items[ctx.parameterCursor.store.id];
-        if (store.data.items.len == ctx.parameterCursor.dataIdx) {
-            params = try store.data.addManyAsSlice(ctx.gpa, weights);
-        } else {
-            params = (store.data.items.ptr + ctx.parameterCursor.dataIdx)[0..weights];
-        }
-        ctx.parameterCursor.dataIdx += weights;
-        return params;
-    }
     fn createRawTensor(ctx: *Context, store: TensorStore, dataLen: u32, batchLen: u32) !struct { Tensor, []f32 } {
-        const sd = &ctx.stores.items[store.id];
+        std.debug.assert(!store.isConst());
+
+        const sd = &ctx.stores.items[store.id >> 1];
         const totalLen = dataLen * batchLen;
         const dataIdx = sd.data.items.len;
         return .{
@@ -165,7 +218,16 @@ pub const Context = struct {
     pub fn initStore(ctx: *Context) !TensorStore {
         const id = ctx.stores.items.len;
         try ctx.stores.append(ctx.gpa, .empty);
-        return .{ .id = @intCast(id) };
+        return .{ .id = @intCast(id << 1) };
+    }
+    pub fn initConstStoreWithRaw(ctx: *Context, buf: []const u32) !TensorStore {
+        const id = ctx.constStores.items.len;
+        const paramPtr: [*]const f32 = @ptrCast(buf.ptr);
+        try ctx.constStores.append(ctx.gpa, .{
+            .data = paramPtr[0..buf.len],
+            .grad = null,
+        });
+        return .{ .id = @intCast((id << 1) | 1) };
     }
 
     fn callForward(ctx: *Context, parameter: TensorPointer, forward: *const fn (xs: Tensor) std.mem.Allocator.Error!Tensor, xs: Tensor) !struct { Tensor, u32 } {
@@ -189,69 +251,74 @@ pub const Context = struct {
 pub const GradDataOffset = struct {
     bytes: usize,
 
-    pub fn ptr(gdo: GradDataOffset, p: [*]f32) [*]f32 {
+    pub fn ptr(gdo: GradDataOffset, p: [*]const f32) [*]f32 {
         return @ptrFromInt(@intFromPtr(p) +% gdo.bytes);
     }
-    pub fn slice(gdo: GradDataOffset, s: []f32) []f32 {
+    pub fn slice(gdo: GradDataOffset, s: []const f32) []f32 {
         const out: [*]f32 = @ptrFromInt(@intFromPtr(s.ptr) +% gdo.bytes);
         return out[0..s.len];
     }
 };
 
-pub const TensorData = struct {
-    data: [*]f32,
-    dataLen: u32,
-    batchStride: u32,
-    batchLen: u32,
+fn TensorDataBase(comptime isConst: bool) type {
+    return struct {
+        data: if (isConst) [*]const f32 else [*]f32,
+        dataLen: u32,
+        batchStride: u32,
+        batchLen: u32,
 
-    pub fn format(
-        t: TensorData,
-        writer: *std.Io.Writer,
-    ) !void {
-        try writer.writeByte('{');
-        if (t.batchLen > 0) {
-            var ptr = t.data;
-            try writer.print("{any}", .{ptr[0..t.dataLen]});
-            const dataEnd = ptr + t.batchLen * t.batchStride;
-            ptr += t.batchStride;
-            while (@intFromPtr(ptr) < @intFromPtr(dataEnd)) {
-                try writer.writeByte(',');
+        pub fn format(t: @This(), writer: *std.Io.Writer) !void {
+            try writer.writeByte('{');
+            if (t.batchLen > 0) {
+                var ptr = t.data;
                 try writer.print("{any}", .{ptr[0..t.dataLen]});
+                const dataEnd = ptr + t.batchLen * t.batchStride;
                 ptr += t.batchStride;
+                while (@intFromPtr(ptr) < @intFromPtr(dataEnd)) {
+                    try writer.writeByte(',');
+                    try writer.print("{any}", .{ptr[0..t.dataLen]});
+                    ptr += t.batchStride;
+                }
+            }
+            try writer.writeByte('}');
+        }
+        pub fn batch(t: @This(), batchIndex: u32) []f32 {
+            const off = batchIndex * t.batchStride;
+            return t.data[off .. off + t.dataLen];
+        }
+        pub fn copyTo(t: @This(), dest: [*]f32) void {
+            var srcPtr = t.data;
+            const srcEnd = srcPtr + t.batchLen * t.batchStride;
+            var destPtr = dest;
+            while (@intFromPtr(srcPtr) < @intFromPtr(srcEnd)) {
+                @memcpy(destPtr[0..t.dataLen], srcPtr[0..t.dataLen]);
+                srcPtr += t.batchStride;
+                destPtr += t.dataLen;
             }
         }
-        try writer.writeByte('}');
-    }
+        pub fn copyFrom(t: @This(), src: [*]const f32) void {
+            if (isConst) {
+                @compileError("is const");
+            }
 
-    pub fn batch(t: TensorData, batchIndex: u32) []f32 {
-        const off = batchIndex * t.batchStride;
-        return t.data[off .. off + t.dataLen];
-    }
-    pub fn copyTo(t: TensorData, dest: [*]f32) void {
-        var srcPtr = t.data;
-        const srcEnd = srcPtr + t.batchLen * t.batchStride;
-        var destPtr = dest;
-        while (@intFromPtr(srcPtr) < @intFromPtr(srcEnd)) {
-            @memcpy(destPtr[0..t.dataLen], srcPtr[0..t.dataLen]);
-            srcPtr += t.batchStride;
-            destPtr += t.dataLen;
+            var destPtr = t.data;
+            const destEnd = destPtr + t.batchLen * t.batchStride;
+            var srcPtr = src;
+            while (@intFromPtr(destPtr) < @intFromPtr(destEnd)) {
+                @memcpy(destPtr[0..t.dataLen], srcPtr[0..t.dataLen]);
+                srcPtr += t.dataLen;
+                destPtr += t.batchStride;
+            }
         }
-    }
-    pub fn copyFrom(t: TensorData, src: [*]const f32) void {
-        var destPtr = t.data;
-        const destEnd = destPtr + t.batchLen * t.batchStride;
-        var srcPtr = src;
-        while (@intFromPtr(destPtr) < @intFromPtr(destEnd)) {
-            @memcpy(destPtr[0..t.dataLen], srcPtr[0..t.dataLen]);
-            srcPtr += t.dataLen;
-            destPtr += t.batchStride;
+        pub fn testingApproxEq(t: @This(), expected: []const f32) !void {
+            var walker = StrideWalker.init(t.data, t.dataLen, t.batchStride, t.batchLen);
+            return walker.testingApproxEq(expected);
         }
-    }
-    pub fn testingApproxEq(t: TensorData, expected: []const f32) !void {
-        var walker = StrideWalker.init(t.data, t.dataLen, t.batchStride, t.batchLen);
-        return walker.testingApproxEq(expected);
-    }
-};
+    };
+}
+
+pub const TensorData = TensorDataBase(true);
+pub const TensorDataMut = TensorDataBase(false);
 
 const Initializer = enum {
     uninit,
@@ -262,13 +329,73 @@ pub const TensorStore = struct {
     id: u32,
 
     pub const def: TensorStore = .{ .id = 0 };
-    pub const network: TensorStore = .{ .id = 1 };
+    pub const network: TensorStore = .{ .id = 2 };
 
-    pub fn data(ts: TensorStore) *TensorStoreData {
+    fn assumeMutStore(ts: TensorStore) *TensorStoreData {
+        std.debug.assert(!ts.isConst());
         const ctx = context orelse unreachable;
-        return &ctx.stores.items[ts.id];
+        return &ctx.stores.items[ts.id >> 1];
+    }
+    fn isConst(ts: TensorStore) bool {
+        return (ts.id & 1) != 0;
     }
 
+    pub fn dataPtrMut(ts: TensorStore) [*]f32 {
+        const ctx = context orelse unreachable;
+        std.debug.assert(!ts.isConst());
+        const idx = ts.id >> 1;
+        return ctx.stores.items[idx].data.items.ptr;
+    }
+    pub fn dataPtr(ts: TensorStore) [*]const f32 {
+        const ctx = context orelse unreachable;
+        const idx = ts.id >> 1;
+        if (ts.isConst()) {
+            return ctx.constStores.items[idx].data.ptr;
+        } else {
+            return ctx.stores.items[idx].data.items.ptr;
+        }
+    }
+    pub fn gradPtr(ts: TensorStore) [*]f32 {
+        const ctx = context orelse unreachable;
+        const idx = ts.id >> 1;
+        if (ts.isConst()) {
+            return ctx.constStores.items[idx].grad.?;
+        } else {
+            return ctx.stores.items[idx].grad.ptr;
+        }
+    }
+    pub fn len(ts: TensorStore) u32 {
+        const ctx = context orelse unreachable;
+        const idx = ts.id >> 1;
+        if (ts.isConst()) {
+            return @intCast(ctx.constStores.items[idx].data.len);
+        } else {
+            return @intCast(ctx.stores.items[idx].data.items.len);
+        }
+    }
+    pub fn gradLen(ts: TensorStore) u32 {
+        const ctx = context orelse unreachable;
+        const idx = ts.id >> 1;
+        if (ts.isConst()) {
+            const sd = &ctx.constStores.items[idx];
+            if (sd.grad == null) {
+                return 0;
+            } else {
+                return @intCast(sd.data.len);
+            }
+        } else {
+            return @intCast(ctx.stores.items[idx].grad.len);
+        }
+    }
+    pub fn gradDataOffset(ts: TensorStore) GradDataOffset {
+        const ctx = context orelse unreachable;
+        const idx = ts.id >> 1;
+        if (ts.isConst()) {
+            return ctx.constStores.items[idx].gradDataOffset();
+        } else {
+            return ctx.stores.items[idx].gradDataOffset();
+        }
+    }
     pub fn create(store: TensorStore, values: []f32, dataLen: u32, batchLen: u32) !Tensor {
         const out, const dest = try store.createUndef(dataLen, batchLen);
         @memcpy(dest, values);
@@ -306,14 +433,16 @@ pub const TensorScope = struct {
     dataIdx: usize,
 
     pub fn save() TensorScope {
+        const ctx = context orelse unreachable;
         return .{
-            .dataIdx = TensorStore.def.data().data.items.len,
+            .dataIdx = ctx.stores.items[0].data.items.len,
         };
     }
     pub fn restore(s: TensorScope) void {
-        const sd = TensorStore.def.data();
-        std.debug.assert(sd.data.items.len >= s.dataIdx);
-        sd.data.items.len = s.dataIdx;
+        const ctx = context orelse unreachable;
+        const data = &ctx.stores.items[0].data.items;
+        std.debug.assert(data.len >= s.dataIdx);
+        data.len = s.dataIdx;
     }
 };
 
@@ -367,7 +496,7 @@ pub const Optimizer = struct {
                     for (stores) |store| {
                         const sd = store.data();
                         const params = sd.data.items;
-                        const grads = sd.grad.items;
+                        const grads = sd.grad;
                         for (params, grads) |*param, grad| {
                             param.* -= grad * lr;
                         }
@@ -424,19 +553,16 @@ pub const Optimizer = struct {
                     const ibt2 = 1 - std.math.pow(f32, b2, adam.step);
 
                     for (stores) |store| {
-                        const sd = store.data();
+                        const sd = store.assumeMutStore();
                         const parameterLen = sd.data.items.len;
-                        if (sd.train.items.len == 0) {
-                            try sd.train.resize(ctx.gpa, parameterLen * 2);
-                            @memset(sd.train.items, 0.0);
+                        if (sd.train.len == 0) {
+                            sd.train = try ctx.gpa.alloc(f32, parameterLen * 2);
+                            @memset(sd.train, 0.0);
                         } else {
-                            std.debug.assert(sd.train.items.len == parameterLen * 2); // parameter length changed
+                            std.debug.assert(sd.train.len == parameterLen * 2); // parameter length changed
                         }
-                        var mvPtr = sd.train.items.ptr;
-                        const params = sd.data.items;
-                        const grads = sd.grad.items;
-
-                        for (params, grads) |*param, grad| {
+                        var mvPtr = sd.train.ptr;
+                        for (sd.data.items, sd.grad) |*param, grad| {
                             var m = mvPtr[0];
                             m = b1 * m + ib1 * grad;
                             mvPtr[0] = m;
@@ -467,7 +593,10 @@ pub const NetworkOptions = struct {
     // dirty state if it's null
     initializeSeed: ?u64 = null,
 
-    store: TensorStore = TensorStore.network,
+    // referenced f32 raw bits
+    rawParameters: ?[]const u32 = null,
+
+    store: ?TensorStore = null,
 };
 
 pub const TrainOptions = struct {
@@ -493,24 +622,33 @@ pub fn Network(T: type) type {
         data: T,
 
         fn init(ctx: *Context, opts: NetworkOptions) !@This() {
-            const scope = TensorScope.save();
-            defer scope.restore();
-
-            const xs, _ = try ctx.createRawTensor(TensorStore.def, T.inputLen, 1);
-            const store = opts.store;
-            const sd = store.data();
-            const parameter: TensorPointer = .{
-                .store = store,
-                .dataIdx = @intCast(sd.data.items.len),
-            };
+            const xs, _ = try ctx.createRawTensor(TensorStore.def, T.inputLen, 0);
 
             const oldInitializer = ctx.initializer;
             defer ctx.initializer = oldInitializer;
             var rand: std.Random.DefaultPrng = undefined;
-            if (opts.initializeSeed) |seed| {
-                rand = .init(seed);
-                ctx.initializer = rand.random();
+            var parameter: TensorPointer = undefined;
+
+            if (opts.rawParameters) |params| {
+                std.debug.assert(opts.initializeSeed == null);
+                std.debug.assert(opts.store == null);
+                const store = try ctx.initConstStoreWithRaw(params);
+                parameter = .{
+                    .store = store,
+                    .dataIdx = 0,
+                };
+            } else {
+                const store = if (opts.store) |s| s else TensorStore.network;
+                parameter = .{
+                    .store = store,
+                    .dataIdx = @intCast(store.assumeMutStore().data.items.len),
+                };
+                if (opts.initializeSeed) |seed| {
+                    rand = .init(seed);
+                    ctx.initializer = rand.random();
+                }
             }
+
             _, const parameterLen = try ctx.callForward(parameter, T.forward, xs);
 
             return .{
@@ -643,11 +781,40 @@ pub fn Network(T: type) type {
         }
 
         pub fn parameters(n: *@This()) []f32 {
+            return n.network.parameter.dataPtrMut()[0..n.network.parameterLen];
+        }
+        pub fn parametersConst(n: *@This()) []const f32 {
             return n.network.parameter.dataPtr()[0..n.network.parameterLen];
         }
         pub fn parameterGradients(n: *@This()) []f32 {
             n.network.parameter.assertGradient(n.network.parameterLen);
             return n.network.parameter.gradientPtr()[0..n.network.parameterLen];
+        }
+        pub fn parametersToZigFileWithWriter(n: *@This(), writer: *std.Io.Writer) !void {
+            try writer.print("pub const parameters: [{}]u32 = .{{\n", .{n.network.parameterLen});
+            var i: u32 = 0;
+            for (n.network.parameter.dataPtr()[0..n.network.parameterLen]) |data| {
+                const datau32: u32 = @bitCast(data);
+                if (i % 4 == 0) {
+                    try writer.writeAll("   ");
+                }
+                try writer.print(" {},", .{datau32});
+                i += 1;
+                if (i % 4 == 0) {
+                    try writer.writeByte('\n');
+                }
+            }
+            if (i % 4 != 0) {
+                try writer.writeByte('\n');
+            }
+            try writer.writeAll("};\n");
+        }
+        pub fn parametersToZigFile(n: *@This(), io: std.Io, sub_path: []const u8) !void {
+            const file = try std.Io.Dir.cwd().createFile(io, sub_path, .{});
+            var buf: [8192]u8 = undefined;
+            var writer = file.writer(io, &buf);
+            try n.parametersToZigFileWithWriter(&writer.interface);
+            try writer.flush();
         }
     };
 }
@@ -668,8 +835,11 @@ pub const Tensor = struct {
     pub fn initUndef(dataLen: u32, batchLen: u32) !struct { Tensor, []f32 } {
         return TensorStore.def.createUndef(dataLen, batchLen);
     }
-    pub fn dataPtr(t: Tensor) [*]f32 {
+    pub fn dataPtr(t: Tensor) [*]const f32 {
         return t.ptr.dataPtr();
+    }
+    pub fn dataPtrMut(t: Tensor) [*]f32 {
+        return t.ptr.dataPtrMut();
     }
     fn assertGradient(t: Tensor) void {
         t.ptr.assertGradient(t.batchStride * t.batchLen);
@@ -685,19 +855,19 @@ pub const Tensor = struct {
         return t.ptr.gradientPtr();
     }
     pub fn gradDataOffset(t: Tensor) GradDataOffset {
-        return t.ptr.store.data().gradDataOffset();
+        return t.ptr.store.gradDataOffset();
     }
     pub fn dataWalker(t: Tensor) StrideWalker {
         return .init(t.dataPtr(), t.dataLen, t.batchStride, t.batchLen);
     }
-    pub fn gradientWalker(t: Tensor) StrideWalker {
+    pub fn gradientWalker(t: Tensor) StrideWalkerMut {
         t.assertGradient();
         return .init(t.gradientPtr(), t.dataLen, t.batchStride, t.batchLen);
     }
-    pub fn dataWalkerRow(t: Tensor) StrideWalker.Row {
+    pub fn dataWalkerRow(t: Tensor) StrideWalkerRow {
         return .init(t.dataPtr(), t.dataLen, t.batchStride, t.batchLen);
     }
-    pub fn gradientWalkerRow(t: Tensor) StrideWalker.Row {
+    pub fn gradientWalkerRow(t: Tensor) StrideWalkerRowMut {
         t.assertGradient();
         return .init(t.gradientPtr(), t.dataLen, t.batchStride, t.batchLen);
     }
@@ -731,17 +901,30 @@ pub const Tensor = struct {
     pub fn data(t: Tensor) TensorData {
         return .{ .data = t.dataPtr(), .dataLen = t.dataLen, .batchStride = t.batchStride, .batchLen = t.batchLen };
     }
-    pub fn gradient(t: Tensor) TensorData {
+    pub fn gradient(t: Tensor) TensorDataMut {
         t.assertGradient();
         return .{ .data = t.gradientPtr(), .dataLen = t.dataLen, .batchStride = t.batchStride, .batchLen = t.batchLen };
+    }
+    pub fn dataMut(t: Tensor) TensorDataMut {
+        return .{ .data = t.dataPtrMut(), .dataLen = t.dataLen, .batchStride = t.batchStride, .batchLen = t.batchLen };
     }
     pub fn backward(t: Tensor, grad: []const f32) !void {
         const ctx = context orelse unreachable;
         std.debug.assert(t.dataLen * t.batchLen == grad.len); // size mismatch
 
         for (ctx.stores.items) |*store| {
-            try store.grad.resize(ctx.gpa, store.data.items.len);
-            @memset(store.grad.items, 0.0);
+            if (store.grad.len != store.data.items.len) {
+                ctx.gpa.free(store.grad);
+                store.grad = try ctx.gpa.alloc(f32, store.data.items.len);
+            }
+            @memset(store.grad, 0.0);
+        }
+        for (ctx.constStores.items) |*store| {
+            if (store.grad == null) {
+                const gradBuf = try ctx.gpa.alloc(f32, store.data.len);
+                store.grad = gradBuf.ptr;
+            }
+            @memset(store.grad.?[0..store.data.len], 0.0);
         }
 
         var dest = t.gradient();
@@ -791,14 +974,18 @@ pub const Tensor = struct {
         const weights = yLen * (xLen + 1);
 
         const param = ctx.parameterCursor;
-        const ps: []f32 = try ctx.getParameters(weights);
+        var ps: []const f32 = undefined;
         if (ctx.initializer) |rand| {
+            const psMut = try ctx.parameterCursor.readMutParameters(weights);
             const inputLenF32: f32 = @floatFromInt(xLen);
             const outputLenF32: f32 = @floatFromInt(yLen);
             const range = std.math.sqrt(6.0 / (inputLenF32 + outputLenF32));
-            for (ps) |*v| {
+            for (psMut) |*v| {
                 v.* = (rand.float(f32) * 2 - 1) * range;
             }
+            ps = psMut;
+        } else {
+            ps = try ctx.parameterCursor.readParameters(weights);
         }
 
         const yt, const ys = try DefTensorPointer.initUndef(yLen * xt.batchLen);
@@ -954,8 +1141,8 @@ pub const Tensor = struct {
         fn backward(b: *@This(), _: *HistoryBuffer) void {
             var xWalker = b.xt.dataWalker();
             var labelWalker = b.labelT.dataWalker();
-            const xGdo = b.xt.ptr.store.data().gradDataOffset();
-            const labelGdo = b.labelT.ptr.store.data().gradDataOffset();
+            const xGdo = b.xt.gradDataOffset();
+            const labelGdo = b.labelT.gradDataOffset();
             const total: f32 = @floatFromInt(b.xt.dataLen * b.xt.batchLen);
             const gy = b.yt.gradientPtr()[0];
             const c = gy * 2 / total;
@@ -1602,7 +1789,7 @@ pub const Tensor = struct {
             const ys = b.yt.dataPtr();
 
             const xGdo = b.xt.gradDataOffset();
-            const yGdo = TensorStore.def.data().gradDataOffset();
+            const yGdo = TensorStore.def.gradDataOffset();
             var yPtr = ys;
 
             var gxWalker = b.xt.gradientWalkerRow();
