@@ -260,9 +260,35 @@ pub const GradDataOffset = struct {
     }
 };
 
+const PrintableSlice = struct {
+    data: []const f32,
+
+    pub fn format(wrapper: PrintableSlice, writer: *std.Io.Writer) !void {
+        const data = wrapper.data;
+        if (data.len == 0) {
+            return writer.writeAll("{}");
+        }
+        try writer.writeAll("{ ");
+        try writer.printFloat(data[0], .{});
+        for (data[1..]) |f| {
+            try writer.writeAll(", ");
+            if (!std.math.isFinite(f)) {
+                try writer.writeAll("\x1b[31m");
+                try writer.printFloat(f, .{});
+                try writer.writeAll("\x1b[0m");
+            } else {
+                try writer.printFloat(f, .{});
+            }
+        }
+        try writer.writeAll(" }");
+    }
+};
+
 fn TensorDataBase(comptime isConst: bool) type {
+    const Ptr = if (isConst) [*]const f32 else [*]f32;
+    const Slice = if (isConst) []const f32 else []f32;
     return struct {
-        data: if (isConst) [*]const f32 else [*]f32,
+        data: Ptr,
         dataLen: u32,
         batchStride: u32,
         batchLen: u32,
@@ -270,19 +296,19 @@ fn TensorDataBase(comptime isConst: bool) type {
         pub fn format(t: @This(), writer: *std.Io.Writer) !void {
             try writer.writeByte('{');
             if (t.batchLen > 0) {
+                try writer.writeAll("\n  ");
                 var ptr = t.data;
-                try writer.print("{any}", .{ptr[0..t.dataLen]});
                 const dataEnd = ptr + t.batchLen * t.batchStride;
-                ptr += t.batchStride;
                 while (@intFromPtr(ptr) < @intFromPtr(dataEnd)) {
-                    try writer.writeByte(',');
-                    try writer.print("{any}", .{ptr[0..t.dataLen]});
+                    try writer.print("{},\n  ", .{
+                        PrintableSlice{ .data = ptr[0..t.dataLen] },
+                    });
                     ptr += t.batchStride;
                 }
             }
             try writer.writeByte('}');
         }
-        pub fn batch(t: @This(), batchIndex: u32) []f32 {
+        pub fn batch(t: @This(), batchIndex: u32) Slice {
             const off = batchIndex * t.batchStride;
             return t.data[off .. off + t.dataLen];
         }
@@ -314,7 +340,26 @@ fn TensorDataBase(comptime isConst: bool) type {
             var walker = StrideWalker.init(t.data, t.dataLen, t.batchStride, t.batchLen);
             return walker.testingApproxEq(expected);
         }
+        pub fn finiteCheck(t: @This()) void {
+            for (0..t.batchLen) |b| {
+                for (t.batch(@intCast(b))) |f| {
+                    if (!std.math.isFinite(f)) {
+                        std.debug.print("{f}\n", .{t});
+                        @breakpoint();
+                    }
+                }
+            }
+        }
     };
+}
+
+pub fn sliceFiniteCheck(slice: []const f32) void {
+    for (slice) |f| {
+        if (!std.math.isFinite(f)) {
+            std.debug.print("{f}\n", .{PrintableSlice{ .data = slice }});
+            @breakpoint();
+        }
+    }
 }
 
 pub const TensorData = TensorDataBase(true);
@@ -683,6 +728,7 @@ pub fn Network(T: type) type {
         pub fn predictWithTensor(n: *@This(), xs: Tensor) !Tensor {
             const ctx = context orelse unreachable;
             if (xs.dataLen != T.inputLen) return Error.SizeMismatch;
+            xs.data().finiteCheck();
 
             const ys, const parameterLen = try ctx.callForward(n.network.parameter, n.network.implement, xs);
             std.debug.assert(parameterLen == n.network.parameterLen);
@@ -877,7 +923,7 @@ pub const Tensor = struct {
     }
     pub fn addOneBatchIfLatest(t: *Tensor) ![]f32 {
         const ctx = context orelse unreachable;
-        const sd = t.ptr.store.data();
+        const sd = t.ptr.store.assumeMutStore();
         std.debug.assert(t.ptr.dataIdx + t.batchStride * t.batchLen == sd.data.items.len);
         t.batchLen += 1;
         const dest = try sd.data.addManyAsSlice(ctx.gpa, t.batchStride);
@@ -1008,6 +1054,16 @@ pub const Tensor = struct {
                     ow += ival * pPtr[0];
                     pPtr += 1;
                 }
+                if (!std.math.isFinite(ow)) {
+                    std.debug.print("inputs = {any}\n", .{inputs});
+                    const from = pPtr - inputs.len;
+                    std.debug.print("params = {any}\n", .{from[0..inputs.len]});
+                    std.debug.print("x batch = {}\n", .{xt.batchLen});
+                    std.debug.print("row = {}\n", .{
+                        @divExact(@intFromPtr(xPtr) - @intFromPtr(xs), @sizeOf(f32) * xStride) - 1,
+                    });
+                    @breakpoint();
+                }
                 yPtr[0] = ow;
                 yPtr += 1;
             }
@@ -1048,24 +1104,47 @@ pub const Tensor = struct {
                 const gyRowEnd = gys + yLen;
                 while (@intFromPtr(gyPtr) < @intFromPtr(gyRowEnd)) {
                     {
-                        var gyColPtr = gyPtr;
                         var w: f32 = 0;
-                        while (@intFromPtr(gyColPtr) < @intFromPtr(gyEnd)) {
-                            w += gyColPtr[0];
-                            gyColPtr += yLen;
+                        {
+                            var gyColPtr = gyPtr;
+                            while (@intFromPtr(gyColPtr) < @intFromPtr(gyEnd)) {
+                                w += gyColPtr[0];
+                                gyColPtr += yLen;
+                            }
+                        }
+                        if (!std.math.isFinite(w)) {
+                            var gyColPtr = gyPtr;
+                            while (@intFromPtr(gyColPtr) < @intFromPtr(gyEnd)) {
+                                std.debug.print("{}, ", .{gyColPtr[0]});
+                                gyColPtr += yLen;
+                            }
+                            std.debug.print("\n", .{});
+                            @breakpoint();
                         }
                         gpPtr[0] += w;
                         gpPtr += 1;
                     }
                     var xPtr = xs;
                     while (@intFromPtr(xPtr) < @intFromPtr(xRowEnd)) {
-                        var gyColPtr = gyPtr;
-                        var xPtrInner = xPtr;
                         var w: f32 = 0;
-                        while (@intFromPtr(gyColPtr) < @intFromPtr(gyEnd)) {
-                            w += xPtrInner[0] * gyColPtr[0];
-                            xPtrInner += xStride;
-                            gyColPtr += yLen;
+                        {
+                            var gyColPtr = gyPtr;
+                            var xPtrInner = xPtr;
+                            while (@intFromPtr(gyColPtr) < @intFromPtr(gyEnd)) {
+                                w += xPtrInner[0] * gyColPtr[0];
+                                xPtrInner += xStride;
+                                gyColPtr += yLen;
+                            }
+                        }
+                        if (!std.math.isFinite(w)) {
+                            var gyColPtr = gyPtr;
+                            var xPtrInner = xPtr;
+                            while (@intFromPtr(gyColPtr) < @intFromPtr(gyEnd)) {
+                                std.debug.print("({}, {}), ", .{ xPtrInner[0], gyColPtr[0] });
+                                xPtrInner += xStride;
+                                gyColPtr += yLen;
+                            }
+                            @breakpoint();
                         }
                         gpPtr[0] += w;
                         gpPtr += 1;
@@ -1093,12 +1172,73 @@ pub const Tensor = struct {
                         pColPtr += paramCols;
                         gyRowPtr += 1;
                     }
+                    if (!std.math.isFinite(w)) {
+                        @breakpoint();
+                    }
                     gxPtr[0] += w;
                     gxPtr += 1;
                     pPtr += 1;
                 }
                 gxPtr += xNext;
                 gyPtr += yLen;
+            }
+        }
+    };
+    pub fn l1Loss(xt: Tensor, labelT: Tensor) !Tensor {
+        const ctx = context orelse unreachable;
+        var out: f32 = 0;
+        const xs = xt.dataPtr();
+        const labels = labelT.dataPtr();
+
+        const xEnd = xs + xt.batchStride * xt.batchLen;
+        const xNext = xt.batchStride - xt.dataLen;
+        const labelNext = labelT.batchStride - labelT.dataLen;
+
+        var xPtr = xs;
+        var labelPtr = labels;
+        while (@intFromPtr(xPtr) < @intFromPtr(xEnd)) {
+            const xRowEnd = xPtr + xt.dataLen;
+            while (@intFromPtr(xPtr) < @intFromPtr(xRowEnd)) {
+                const diff = xPtr[0] - labelPtr[0];
+                out += @abs(diff);
+                xPtr += 1;
+                labelPtr += 1;
+            }
+            xPtr += xNext;
+            labelPtr += labelNext;
+        }
+        const total: f32 = @floatFromInt(xt.dataLen * xt.batchLen);
+        out /= total;
+
+        const yt, const ys = try DefTensorPointer.initUndef(1);
+        ys[0] = out;
+        try ctx.history.write(ctx.gpa, L1LossBackward{ .xt = xt, .labelT = labelT, .yt = yt });
+        return yt.asTensor(1, 1, 1);
+    }
+    const L1LossBackward = struct {
+        xt: Tensor,
+        labelT: Tensor,
+        yt: DefTensorPointer,
+
+        fn backward(b: *@This(), _: *HistoryBuffer) void {
+            var xWalker = b.xt.dataWalker();
+            var labelWalker = b.labelT.dataWalker();
+            const xGdo = b.xt.gradDataOffset();
+            const labelGdo = b.labelT.gradDataOffset();
+            const total: f32 = @floatFromInt(b.xt.dataLen * b.xt.batchLen);
+            const gy = b.yt.gradientPtr()[0];
+            const c = gy / total;
+
+            while (xWalker.next()) {
+                std.debug.assert(labelWalker.next());
+                const grad = std.math.sign(xWalker.ptr[0] - labelWalker.ptr[0]) * c;
+                if (!std.math.isFinite(grad)) {
+                    std.debug.print("x = {f}\n", .{b.xt});
+                    std.debug.print("label = {f}\n", .{b.labelT});
+                    @breakpoint();
+                }
+                xGdo.ptr(xWalker.ptr)[0] += grad;
+                labelGdo.ptr(labelWalker.ptr)[0] -= grad;
             }
         }
     };
@@ -1150,6 +1290,11 @@ pub const Tensor = struct {
             while (xWalker.next()) {
                 std.debug.assert(labelWalker.next());
                 const grad = (xWalker.ptr[0] - labelWalker.ptr[0]) * c;
+                if (!std.math.isFinite(grad)) {
+                    std.debug.print("x = {f}\n", .{b.xt});
+                    std.debug.print("label = {f}\n", .{b.labelT});
+                    @breakpoint();
+                }
                 xGdo.ptr(xWalker.ptr)[0] += grad;
                 labelGdo.ptr(labelWalker.ptr)[0] -= grad;
             }
@@ -1300,15 +1445,21 @@ pub const Tensor = struct {
     };
     pub fn mul(x1t: Tensor, x2t: Tensor) !Tensor {
         const ctx = context orelse unreachable;
-        if (x1t.dataLen != x2t.dataLen) return Error.SizeMismatch;
-        if (x1t.batchLen != x2t.batchLen) return Error.SizeMismatch;
+        std.debug.assert(x1t.dataLen == x2t.dataLen);
+        std.debug.assert(x1t.batchLen == x2t.batchLen);
         const yt, const ys = try DefTensorPointer.initUndef(x1t.dataLen * x1t.batchLen);
         var x1Walker = x1t.dataWalker();
         var x2Walker = x2t.dataWalker();
         var yPtr = ys.ptr;
         while (x1Walker.next()) {
             _ = x2Walker.next();
-            yPtr[0] = x1Walker.ptr[0] * x2Walker.ptr[0];
+            const res = x1Walker.ptr[0] * x2Walker.ptr[0];
+            yPtr[0] = res;
+            if (!std.math.isFinite(res)) {
+                std.debug.print("x1 = {f}\n", .{x1t});
+                std.debug.print("x2 = {f}\n", .{x2t});
+                @breakpoint();
+            }
             yPtr += 1;
         }
         try ctx.history.write(ctx.gpa, MulBackward{
@@ -1682,14 +1833,21 @@ pub const Tensor = struct {
 
         while (xWalker.next()) {
             const x = xWalker.ptr[0];
+            var res: f32 = undefined;
             if (x >= 0) {
                 const z = std.math.exp(-x);
-                yPtr[0] = 1.0 / (1.0 + z);
+                res = 1.0 / (1.0 + z);
             } else {
                 const z = std.math.exp(x);
-                yPtr[0] = z / (1.0 + z);
+                res = z / (1.0 + z);
             }
+            yPtr[0] = res;
             // yPtr[0] = 1 / (1 + std.math.exp(x));
+
+            if (!std.math.isFinite(res)) {
+                std.debug.print("x = {f}\n", .{xt});
+                @breakpoint();
+            }
             yPtr += 1;
         }
         try ctx.history.write(ctx.gpa, SigmoidBackward{
