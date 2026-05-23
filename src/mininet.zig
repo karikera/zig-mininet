@@ -656,29 +656,29 @@ pub const TrainOptions = struct {
 };
 
 pub const NetworkParameters = struct {
-    parameter: TensorPointer,
-    parameterLen: u32,
+    ptr: TensorPointer,
+    len: u32,
 
-    pub fn dataMut(n: *NetworkParameters) []f32 {
-        return n.parameter.dataPtrMut()[0..n.parameterLen];
-    }
     pub fn bytes(n: *NetworkParameters) []const u8 {
-        return std.mem.sliceAsBytes(n.parameter.dataPtr()[0..n.parameterLen]);
+        return std.mem.sliceAsBytes(n.ptr.dataPtr()[0..n.len]);
     }
     pub fn bytesMut(n: *NetworkParameters) []u8 {
-        return std.mem.sliceAsBytes(n.parameter.dataPtrMut()[0..n.parameterLen]);
+        return std.mem.sliceAsBytes(n.ptr.dataPtrMut()[0..n.len]);
     }
     pub fn data(n: *NetworkParameters) []const f32 {
-        return n.parameter.dataPtr()[0..n.parameterLen];
+        return n.ptr.dataPtr()[0..n.len];
+    }
+    pub fn dataMut(n: *NetworkParameters) []f32 {
+        return n.ptr.dataPtrMut()[0..n.len];
     }
     pub fn gradients(n: *NetworkParameters) []f32 {
-        n.parameter.assertGradient(n.parameterLen);
-        return n.parameter.gradientPtr()[0..n.parameterLen];
+        n.ptr.assertGradient(n.len);
+        return n.ptr.gradientPtr()[0..n.len];
     }
     pub fn toZigFileWithWriter(n: *NetworkParameters, writer: *std.Io.Writer) !void {
-        try writer.print("pub const parameters: [{}]u32 = .{{\n", .{n.parameterLen});
+        try writer.print("pub const parameters: [{}]u32 = .{{\n", .{n.len});
         var i: u32 = 0;
-        for (n.parameter.dataPtr()[0..n.parameterLen]) |d| {
+        for (n.ptr.dataPtr()[0..n.len]) |d| {
             const du32: u32 = @bitCast(d);
             if (i % 4 == 0) {
                 try writer.writeAll("   ");
@@ -700,6 +700,15 @@ pub const NetworkParameters = struct {
         var writer = file.writer(io, &buf);
         try n.toZigFileWithWriter(&writer.interface);
         try writer.flush();
+    }
+    pub fn clamp(n: *NetworkParameters, min: f32, max: f32) !void {
+        for (n.dataMut()) |*d| {
+            if (d.* < min) {
+                d.* = min;
+            } else if (d.* > max) {
+                d.* = max;
+            }
+        }
     }
 };
 
@@ -741,8 +750,8 @@ pub fn Network(T: type) type {
 
             return .{
                 .parameters = .{
-                    .parameter = parameter,
-                    .parameterLen = parameterLen,
+                    .ptr = parameter,
+                    .len = parameterLen,
                 },
                 .data = data,
             };
@@ -772,8 +781,8 @@ pub fn Network(T: type) type {
             if (xs.dataLen != T.inputLen) return Error.SizeMismatch;
             xs.data().finiteCheck();
 
-            const ys, const parameterLen = try ctx.callForward(T, &n.data, n.parameters.parameter, xs);
-            std.debug.assert(parameterLen == n.parameters.parameterLen);
+            const ys, const parameterLen = try ctx.callForward(T, &n.data, n.parameters.ptr, xs);
+            std.debug.assert(parameterLen == n.parameters.len);
             return ys;
         }
 
@@ -786,7 +795,7 @@ pub fn Network(T: type) type {
             std.debug.assert(loss.dataLen == 1 and loss.batchLen == 1);
             try loss.backward(&.{1.0});
             try optimizer.optimize(&.{
-                n.parameters.parameter.store,
+                n.parameters.ptr.store,
             });
             return loss;
         }
