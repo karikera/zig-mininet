@@ -39,6 +39,18 @@
       "environment": [],
       "console": "integratedTerminal",
       "preLaunchTask": "build mininet"
+    },
+    {
+      "name": "debug fixed int",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/zig-out/bin/example-fixed-int.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "console": "integratedTerminal",
+      "preLaunchTask": "build mininet"
     }
   ]
 }

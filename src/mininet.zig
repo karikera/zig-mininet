@@ -5,6 +5,8 @@ const StrideWalkerMut = stridewalker.StrideWalkerMut;
 const StrideWalkerRow = stridewalker.StrideWalkerRow;
 const StrideWalkerRowMut = stridewalker.StrideWalkerRowMut;
 
+pub const fixed = @import("fixed.zig");
+
 threadlocal var context: ?*Context = null;
 
 const TensorStoreData = struct {

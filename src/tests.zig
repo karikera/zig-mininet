@@ -21,6 +21,7 @@ fn testingApproxEq(expected: []const f32, actual: []const f32) !void {
 
 test {
     _ = @import("stridewalker.zig");
+    _ = @import("fixed.zig");
 }
 
 test "mininet linear" {
