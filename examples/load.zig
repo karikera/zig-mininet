@@ -10,7 +10,7 @@ pub fn main(init: std.process.Init) !void {
     // define network
     var simpleNet = try ctx.initNetwork(struct {
         pub const inputLen = 2;
-        pub fn forward(input: mininet.Tensor) !mininet.Tensor {
+        pub fn forward(_: *@This(), input: mininet.Tensor) !mininet.Tensor {
             var tensor = input;
             tensor = try tensor.linear(4);
             tensor = try tensor.relu();

@@ -233,7 +233,7 @@ pub const Context = struct {
         return .{ .id = @intCast((id << 1) | 1) };
     }
 
-    fn callForward(ctx: *Context, parameter: TensorPointer, forward: *const fn (xs: Tensor) std.mem.Allocator.Error!Tensor, xs: Tensor) !struct { Tensor, u32 } {
+    fn callForward(ctx: *Context, Base: type, base: *Base, parameter: TensorPointer, xs: Tensor) !struct { Tensor, u32 } {
         if (ctx.callStackLevelCheck == 0) {
             ctx.history.clearRetainingCapacity();
         }
@@ -245,7 +245,7 @@ pub const Context = struct {
         }
         ctx.parameterCursor = parameter;
 
-        const ys = try forward(xs);
+        const ys = try base.forward(xs);
         const parameterLen: u32 = @intCast(ctx.parameterCursor.dataIdx - parameter.dataIdx);
         return .{ ys, parameterLen };
     }
@@ -657,7 +657,6 @@ pub const TrainOptions = struct {
 const NetworkCommon = struct {
     parameter: TensorPointer,
     parameterLen: u32,
-    implement: *const fn (xs: Tensor) std.mem.Allocator.Error!Tensor,
 };
 
 pub fn Network(T: type) type {
@@ -693,15 +692,15 @@ pub fn Network(T: type) type {
                 }
             }
 
-            _, const parameterLen = try ctx.callForward(parameter, T.forward, xs);
+            var data: T = .{};
+            _, const parameterLen = try ctx.callForward(T, &data, parameter, xs);
 
             return .{
                 .network = .{
                     .parameter = parameter,
                     .parameterLen = parameterLen,
-                    .implement = T.forward,
                 },
-                .data = .{},
+                .data = data,
             };
         }
 
@@ -729,7 +728,7 @@ pub fn Network(T: type) type {
             if (xs.dataLen != T.inputLen) return Error.SizeMismatch;
             xs.data().finiteCheck();
 
-            const ys, const parameterLen = try ctx.callForward(n.network.parameter, n.network.implement, xs);
+            const ys, const parameterLen = try ctx.callForward(T, &n.data, n.network.parameter, xs);
             std.debug.assert(parameterLen == n.network.parameterLen);
             return ys;
         }
