@@ -29,7 +29,7 @@ test "mininet linear" {
     defer ctx.deinit();
 
     var testNet = try ctx.initNetwork(TestNet, .{});
-    @memcpy(testNet.parameters(), &[_]f32{ 0.7, 0.1, 0.2, 0.8, 0.3, 0.4, 0.9, 0.5, 0.6 });
+    @memcpy(testNet.parameters.dataMut(), &[_]f32{ 0.7, 0.1, 0.2, 0.8, 0.3, 0.4, 0.9, 0.5, 0.6 });
     try testingApproxEq(&.{ 1.2, 1.9, 2.6 }, try testNet.predict(&.{ 1, 2 }));
     try testingApproxEq(&.{ 1.8, 3.3, 4.8 }, try testNet.predict(&.{ 3, 4 }));
     try testingApproxEq(&.{ 1.2, 1.9, 2.6, 1.8, 3.3, 4.8 }, try testNet.predict(&.{ 1, 2, 3, 4 }));
@@ -41,7 +41,7 @@ test "mininet backward" {
     defer ctx.deinit();
 
     var testNet = try ctx.initNetwork(TestNet, .{});
-    @memcpy(testNet.parameters(), &[_]f32{ 0.7, 0.1, 0.2, 0.8, 0.3, 0.4, 0.9, 0.5, 0.6 });
+    @memcpy(testNet.parameters.dataMut(), &[_]f32{ 0.7, 0.1, 0.2, 0.8, 0.3, 0.4, 0.9, 0.5, 0.6 });
 
     const scope = mininet.TensorScope.save();
     defer scope.restore();
@@ -53,7 +53,10 @@ test "mininet backward" {
     try loss.backward(&.{1});
 
     try ys.gradient().testingApproxEq(&.{ 0.2 / 3.0, -0.1 / 3.0, -0.4 / 3.0, -2.2 / 3.0, -1.7 / 3.0, -0.4 });
-    try testingApproxEq(&.{ -2.0 / 3.0, -6.4 / 3.0, -2.8, -0.6, -5.2 / 3.0, -7.0 / 3.0, -1.6 / 3.0, -4.0 / 3.0, -5.6 / 3.0 }, testNet.parameterGradients());
+    try testingApproxEq(
+        &.{ -2.0 / 3.0, -6.4 / 3.0, -2.8, -0.6, -5.2 / 3.0, -7.0 / 3.0, -1.6 / 3.0, -4.0 / 3.0, -5.6 / 3.0 },
+        testNet.parameters.gradients(),
+    );
     try xs.gradient().testingApproxEq(&.{ -0.07, -0.08, -1.33 / 3.0, -1.84 / 3.0 });
 }
 

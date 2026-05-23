@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !void {
     defer simpleNet.deinit();
 
     // save as zig source
-    // try simpleNet.parametersToZigFile(init.io, "examples/generated_xor_params.zig");
+    // try simpleNet.parameters.toZigFile(init.io, "examples/generated_xor_params.zig");
 
     // predict
     {

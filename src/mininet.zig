@@ -233,7 +233,7 @@ pub const Context = struct {
         return .{ .id = @intCast((id << 1) | 1) };
     }
 
-    fn callForward(ctx: *Context, Base: type, base: *Base, parameter: TensorPointer, xs: Tensor) !struct { Tensor, u32 } {
+    fn callForward(ctx: *Context, T: type, base: *T, parameter: TensorPointer, xs: Tensor) !struct { Tensor, u32 } {
         if (ctx.callStackLevelCheck == 0) {
             ctx.history.clearRetainingCapacity();
         }
@@ -245,7 +245,7 @@ pub const Context = struct {
         }
         ctx.parameterCursor = parameter;
 
-        const ys = try base.forward(xs);
+        const ys = try T.forward(base, xs);
         const parameterLen: u32 = @intCast(ctx.parameterCursor.dataIdx - parameter.dataIdx);
         return .{ ys, parameterLen };
     }
@@ -647,6 +647,7 @@ pub const TrainOptions = struct {
     batchSize: u32 = 64,
     optimizer: ?Optimizer = null, // default is SGD
     lossFn: ?LossFn = null, // default is Tensor.l2Loss
+    afterOptimize: ?*const fn (n: *NetworkParameters) std.mem.Allocator.Error!void = null,
 
     io: ?std.Io = null, // for printing loss and measureing the printing interval
     stdout: ?*std.Io.Writer = null, // for printing loss.
@@ -654,14 +655,57 @@ pub const TrainOptions = struct {
     validation: ?TensorPair = null,
 };
 
-const NetworkCommon = struct {
+pub const NetworkParameters = struct {
     parameter: TensorPointer,
     parameterLen: u32,
+
+    pub fn dataMut(n: *NetworkParameters) []f32 {
+        return n.parameter.dataPtrMut()[0..n.parameterLen];
+    }
+    pub fn bytes(n: *NetworkParameters) []const u8 {
+        return std.mem.sliceAsBytes(n.parameter.dataPtr()[0..n.parameterLen]);
+    }
+    pub fn bytesMut(n: *NetworkParameters) []u8 {
+        return std.mem.sliceAsBytes(n.parameter.dataPtrMut()[0..n.parameterLen]);
+    }
+    pub fn data(n: *NetworkParameters) []const f32 {
+        return n.parameter.dataPtr()[0..n.parameterLen];
+    }
+    pub fn gradients(n: *NetworkParameters) []f32 {
+        n.parameter.assertGradient(n.parameterLen);
+        return n.parameter.gradientPtr()[0..n.parameterLen];
+    }
+    pub fn toZigFileWithWriter(n: *NetworkParameters, writer: *std.Io.Writer) !void {
+        try writer.print("pub const parameters: [{}]u32 = .{{\n", .{n.parameterLen});
+        var i: u32 = 0;
+        for (n.parameter.dataPtr()[0..n.parameterLen]) |d| {
+            const du32: u32 = @bitCast(d);
+            if (i % 4 == 0) {
+                try writer.writeAll("   ");
+            }
+            try writer.print(" {},", .{du32});
+            i += 1;
+            if (i % 4 == 0) {
+                try writer.writeByte('\n');
+            }
+        }
+        if (i % 4 != 0) {
+            try writer.writeByte('\n');
+        }
+        try writer.writeAll("};\n");
+    }
+    pub fn toZigFile(n: *NetworkParameters, io: std.Io, sub_path: []const u8) !void {
+        const file = try std.Io.Dir.cwd().createFile(io, sub_path, .{});
+        var buf: [8192]u8 = undefined;
+        var writer = file.writer(io, &buf);
+        try n.toZigFileWithWriter(&writer.interface);
+        try writer.flush();
+    }
 };
 
 pub fn Network(T: type) type {
     return struct {
-        network: NetworkCommon,
+        parameters: NetworkParameters,
         data: T,
 
         fn init(ctx: *Context, opts: NetworkOptions) !@This() {
@@ -696,7 +740,7 @@ pub fn Network(T: type) type {
             _, const parameterLen = try ctx.callForward(T, &data, parameter, xs);
 
             return .{
-                .network = .{
+                .parameters = .{
                     .parameter = parameter,
                     .parameterLen = parameterLen,
                 },
@@ -728,8 +772,8 @@ pub fn Network(T: type) type {
             if (xs.dataLen != T.inputLen) return Error.SizeMismatch;
             xs.data().finiteCheck();
 
-            const ys, const parameterLen = try ctx.callForward(T, &n.data, n.network.parameter, xs);
-            std.debug.assert(parameterLen == n.network.parameterLen);
+            const ys, const parameterLen = try ctx.callForward(T, &n.data, n.parameters.parameter, xs);
+            std.debug.assert(parameterLen == n.parameters.parameterLen);
             return ys;
         }
 
@@ -739,9 +783,10 @@ pub fn Network(T: type) type {
             defer scope.restore();
             const ys = try n.predictWithTensor(pair.inputs);
             const loss = try lossFn(ys, pair.labels);
+            std.debug.assert(loss.dataLen == 1 and loss.batchLen == 1);
             try loss.backward(&.{1.0});
             try optimizer.optimize(&.{
-                n.network.parameter.store,
+                n.parameters.parameter.store,
             });
             return loss;
         }
@@ -780,6 +825,10 @@ pub fn Network(T: type) type {
                         const subpair = pair.batchSubarray(i, batchEnd);
                         const loss = try n.trainOnceWithTensor(subpair, optimizer, lossFn);
                         lossSum += loss.dataPtr()[0];
+
+                        if (opts.afterOptimize) |afterOptimize| {
+                            try afterOptimize(&n.parameters);
+                        }
                     }
                     i += opts.batchSize;
                     step += 1;
@@ -825,43 +874,6 @@ pub fn Network(T: type) type {
 
             const pair = try TensorPair.init(data);
             return n.trainWithTensor(pair, opts);
-        }
-
-        pub fn parameters(n: *@This()) []f32 {
-            return n.network.parameter.dataPtrMut()[0..n.network.parameterLen];
-        }
-        pub fn parametersConst(n: *@This()) []const f32 {
-            return n.network.parameter.dataPtr()[0..n.network.parameterLen];
-        }
-        pub fn parameterGradients(n: *@This()) []f32 {
-            n.network.parameter.assertGradient(n.network.parameterLen);
-            return n.network.parameter.gradientPtr()[0..n.network.parameterLen];
-        }
-        pub fn parametersToZigFileWithWriter(n: *@This(), writer: *std.Io.Writer) !void {
-            try writer.print("pub const parameters: [{}]u32 = .{{\n", .{n.network.parameterLen});
-            var i: u32 = 0;
-            for (n.network.parameter.dataPtr()[0..n.network.parameterLen]) |data| {
-                const datau32: u32 = @bitCast(data);
-                if (i % 4 == 0) {
-                    try writer.writeAll("   ");
-                }
-                try writer.print(" {},", .{datau32});
-                i += 1;
-                if (i % 4 == 0) {
-                    try writer.writeByte('\n');
-                }
-            }
-            if (i % 4 != 0) {
-                try writer.writeByte('\n');
-            }
-            try writer.writeAll("};\n");
-        }
-        pub fn parametersToZigFile(n: *@This(), io: std.Io, sub_path: []const u8) !void {
-            const file = try std.Io.Dir.cwd().createFile(io, sub_path, .{});
-            var buf: [8192]u8 = undefined;
-            var writer = file.writer(io, &buf);
-            try n.parametersToZigFileWithWriter(&writer.interface);
-            try writer.flush();
         }
     };
 }

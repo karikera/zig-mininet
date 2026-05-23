@@ -22,17 +22,17 @@ pub fn main(init: std.process.Init) !void {
 
     // load
     const parameters = try std.Io.Dir.cwd().readFileAlloc(init.io, "examples/load.bin", init.gpa, .unlimited);
-    @memcpy(std.mem.sliceAsBytes(simpleNet.parameters()), parameters);
+    @memcpy(simpleNet.parameters.bytesMut(), parameters);
     init.gpa.free(parameters);
 
     // save
     // try std.Io.Dir.cwd().writeFile(init.io, .{
-    //     .data = std.mem.sliceAsBytes(simpleNet.parameters()),
+    //     .data = simpleNet.parameters.bytes(),
     //     .sub_path = "examples/load.bin",
     // });
 
     // save as zig source
-    try simpleNet.parametersToZigFile(init.io, "examples/load_raw_generated.zig");
+    try simpleNet.parameters.toZigFile(init.io, "examples/load_raw_generated.zig");
 
     // predict
     {
