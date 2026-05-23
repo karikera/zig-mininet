@@ -191,6 +191,9 @@ pub const Context = struct {
             context = null;
         }
     }
+    pub fn current() ?*Context {
+        return context;
+    }
 
     fn createRawTensor(ctx: *Context, store: TensorStore, dataLen: u32, batchLen: u32) !struct { Tensor, []f32 } {
         std.debug.assert(!store.isConst());

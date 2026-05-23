@@ -44,10 +44,10 @@ pub fn main(init: std.process.Init) !void {
     });
 
     // save
-    // try std.Io.Dir.cwd().writeFile(init.io, .{
-    //     .data = std.mem.sliceAsBytes(simpleNet.parameters()),
-    //     .sub_path = "examples/load.bin",
-    // });
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .data = std.mem.sliceAsBytes(simpleNet.parameters()),
+        .sub_path = "examples/load.bin",
+    });
 
     // predict
     {
