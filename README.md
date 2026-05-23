@@ -57,8 +57,7 @@ pub fn main(init: std.process.Init) !void {
     defer simpleNet.deinit();
 
     // train
-    var opt = try mininet.Optimizer.Adam.init(.{ .learningRate = 0.005 });
-    defer opt.deinit();
+    var opt = mininet.Optimizer.Adam.init(.{ .learningRate = 0.005 });
     try simpleNet.train(&.{ .{
         .input = &.{ 0.0, 0.0 },
         .label = &.{0.0},
@@ -71,7 +70,12 @@ pub fn main(init: std.process.Init) !void {
     }, .{
         .input = &.{ 1.0, 1.0 },
         .label = &.{0.0},
-    } }, .{ .optimizer = opt.optimizer(), .epoch = 500, .io = init.io });
+    } }, .{
+        .optimizer = opt.optimizer(), // default sgd
+        .epoch = 500, // default 1000
+        .lossFn = mininet.Tensor.l2Loss, // default L2 loss
+        .io = init.io, // for printing loss
+    });
 
     // predict
     {

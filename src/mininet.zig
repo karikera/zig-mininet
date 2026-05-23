@@ -523,14 +523,10 @@ pub const Optimizer = struct {
     pub const SGD = struct {
         learningRate: f32,
 
-        pub fn init(learningRate: f32) !SGD {
+        pub fn init(learningRate: f32) SGD {
             return .{
                 .learningRate = learningRate,
             };
-        }
-
-        pub fn deinit(this: *SGD) void {
-            this.* = undefined;
         }
 
         pub fn optimizer(this: *SGD) Optimizer {
@@ -539,7 +535,7 @@ pub const Optimizer = struct {
                     const sgd: *SGD = @ptrCast(@alignCast(data));
                     const lr = sgd.learningRate;
                     for (stores) |store| {
-                        const sd = store.data();
+                        const sd = store.assumeMutStore();
                         const params = sd.data.items;
                         const grads = sd.grad;
                         for (params, grads) |*param, grad| {
@@ -568,7 +564,7 @@ pub const Optimizer = struct {
             epsilon: f32 = 1e-8,
         };
 
-        pub fn init(opts: Options) !Adam {
+        pub fn init(opts: Options) Adam {
             return .{
                 .learningRate = opts.learningRate,
                 .b1 = opts.b1,
@@ -576,9 +572,6 @@ pub const Optimizer = struct {
                 .epsilon = opts.epsilon,
                 .step = 0,
             };
-        }
-        pub fn deinit(this: *Adam) void {
-            this.* = undefined;
         }
 
         pub fn optimizer(this: *Adam) Optimizer {
@@ -644,10 +637,13 @@ pub const NetworkOptions = struct {
     store: ?TensorStore = null,
 };
 
+pub const LossFn = *const fn (predicted: Tensor, labels: Tensor) std.mem.Allocator.Error!Tensor;
+
 pub const TrainOptions = struct {
     epoch: u32 = 1000,
     batchSize: u32 = 64,
-    optimizer: Optimizer,
+    optimizer: ?Optimizer = null, // default is SGD
+    lossFn: ?LossFn = null, // default is Tensor.l2Loss
 
     io: ?std.Io = null, // for printing loss and measureing the printing interval
     stdout: ?*std.Io.Writer = null, // for printing loss.
@@ -736,11 +732,11 @@ pub fn Network(T: type) type {
         }
 
         // return loss
-        pub fn trainOnceWithTensor(n: *@This(), pair: TensorPair, optimizer: Optimizer) !Tensor {
+        pub fn trainOnceWithTensor(n: *@This(), pair: TensorPair, optimizer: Optimizer, lossFn: LossFn) !Tensor {
             const scope = TensorScope.save();
             defer scope.restore();
             const ys = try n.predictWithTensor(pair.inputs);
-            const loss = try ys.l2Loss(pair.labels);
+            const loss = try lossFn(ys, pair.labels);
             try loss.backward(&.{1.0});
             try optimizer.optimize(&.{
                 n.network.parameter.store,
@@ -756,6 +752,9 @@ pub fn Network(T: type) type {
             const stepPerEpoch = @divTrunc(pair.inputs.batchLen + opts.batchSize - 1, opts.batchSize);
             const printStepInterval = @max((opts.epoch * stepPerEpoch + 5) / 10, 1);
             const printDuraInterval = std.Io.Duration.fromSeconds(1);
+            var sgd = Optimizer.SGD{ .learningRate = 0.01 };
+            const optimizer = opts.optimizer orelse sgd.optimizer();
+            const lossFn = opts.lossFn orelse Tensor.l2Loss;
             var printedStep: u32 = 0;
             var nextPrintedTime = if (opts.io) |io| std.Io.Clock.awake.now(io).addDuration(printDuraInterval) else undefined;
 
@@ -777,7 +776,7 @@ pub fn Network(T: type) type {
                     {
                         const batchEnd = @min(i + opts.batchSize, pair.inputs.batchLen);
                         const subpair = pair.batchSubarray(i, batchEnd);
-                        const loss = try n.trainOnceWithTensor(subpair, opts.optimizer);
+                        const loss = try n.trainOnceWithTensor(subpair, optimizer, lossFn);
                         lossSum += loss.dataPtr()[0];
                     }
                     i += opts.batchSize;

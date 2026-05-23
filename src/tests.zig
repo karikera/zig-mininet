@@ -57,6 +57,33 @@ test "mininet backward" {
     try xs.gradient().testingApproxEq(&.{ -0.07, -0.08, -1.33 / 3.0, -1.84 / 3.0 });
 }
 
+test "mininet optimizer" {
+    var ctx = try mininet.Context.init(std.testing.allocator);
+    _ = ctx.set();
+    defer ctx.deinit();
+
+    var testNet = try ctx.initNetwork(TestNet, .{
+        .initializeSeed = testSeed,
+    });
+    const pair: []const mininet.DataPair = &.{
+        .{ .input = &.{ 1, 2 }, .label = &.{ 1, 2, 3 } },
+    };
+
+    try testNet.train(pair, .{});
+
+    var sgd = mininet.Optimizer.SGD.init(0.001);
+    try testNet.train(pair, .{
+        .optimizer = sgd.optimizer(),
+        .lossFn = mininet.Tensor.l1Loss,
+    });
+
+    var adam = mininet.Optimizer.Adam.init(.{});
+    try testNet.train(pair, .{
+        .optimizer = adam.optimizer(),
+        .lossFn = mininet.Tensor.l2Loss,
+    });
+}
+
 test "mininet neg" {
     var ctx = try mininet.Context.init(std.testing.allocator);
     _ = ctx.set();
