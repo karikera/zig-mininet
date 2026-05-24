@@ -626,6 +626,80 @@ pub const Optimizer = struct {
             };
         }
     };
+    pub const AdamW = struct {
+        adam: Adam,
+        weightDecay: f32,
+
+        pub const Options = struct {
+            learningRate: f32 = 0.001,
+            b1: f32 = 0.9,
+            b2: f32 = 0.999,
+            epsilon: f32 = 1e-8,
+            weightDecay: f32 = 0.01,
+        };
+
+        pub fn init(opts: Options) AdamW {
+            return .{
+                .adam = .{
+                    .learningRate = opts.learningRate,
+                    .b1 = opts.b1,
+                    .b2 = opts.b2,
+                    .epsilon = opts.epsilon,
+                    .step = 0,
+                },
+                .weightDecay = opts.weightDecay,
+            };
+        }
+
+        pub fn optimizer(this: *AdamW) Optimizer {
+            const Impl = struct {
+                fn optimizeImpl(data: *anyopaque, stores: []const TensorStore) std.mem.Allocator.Error!void {
+                    const ctx = context orelse unreachable;
+                    const adamw: *AdamW = @ptrCast(@alignCast(data));
+                    const adam = &adamw.adam;
+
+                    const b1 = adam.b1;
+                    const b2 = adam.b2;
+                    const ib1 = 1 - adam.b1;
+                    const ib2 = 1 - adam.b2;
+                    const lr = adam.learningRate;
+                    const e = adam.epsilon;
+                    const wd = adamw.weightDecay;
+                    adam.step += 1.0;
+                    const ibt1 = 1 - std.math.pow(f32, b1, adam.step);
+                    const ibt2 = 1 - std.math.pow(f32, b2, adam.step);
+
+                    for (stores) |store| {
+                        const sd = store.assumeMutStore();
+                        const parameterLen = sd.data.items.len;
+                        if (sd.train.len == 0) {
+                            sd.train = try ctx.gpa.alloc(f32, parameterLen * 2);
+                            @memset(sd.train, 0.0);
+                        } else {
+                            std.debug.assert(sd.train.len == parameterLen * 2); // parameter length changed
+                        }
+                        var mvPtr = sd.train.ptr;
+                        for (sd.data.items, sd.grad) |*param, grad| {
+                            var m = mvPtr[0];
+                            m = b1 * m + ib1 * grad;
+                            mvPtr[0] = m;
+                            mvPtr += 1;
+                            var v = mvPtr[0];
+                            v = b2 * v + ib2 * (grad * grad);
+                            mvPtr[0] = v;
+                            mvPtr += 1;
+                            const res = lr * ((m / ibt1) / (std.math.sqrt(v / ibt2) + e) + wd * param.*);
+                            param.* -= res;
+                        }
+                    }
+                }
+            };
+            return .{
+                .data = @ptrCast(this),
+                .optimizeFn = Impl.optimizeImpl,
+            };
+        }
+    };
 
     pub fn optimize(opt: Optimizer, stores: []const TensorStore) !void {
         return opt.optimizeFn(opt.data, stores);
